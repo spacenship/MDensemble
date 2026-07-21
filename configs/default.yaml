@@ -1,0 +1,78 @@
+# Default configuration for protein_dual_flow.
+# This mirrors protein_flow/config.py::Config exactly; any field omitted here
+# falls back to the dataclass default.
+
+data:
+  plm_dim: 320
+  num_amino_acid_types: 22
+  min_length: 16
+  max_length: 48
+  train_size: 256
+  val_size: 32
+  batch_size: 8
+  num_workers: 0
+  seed: 0
+
+model:
+  sequence_encoder:
+    hidden_dim: 128
+    num_layers: 3
+    dropout: 0.1
+    use_position_encoding: true
+  geometric_encoder:
+    hidden_dim: 128
+    num_layers: 3
+    dropout: 0.1
+    update_coordinates: false
+  fusion:
+    hidden_dim: 128
+    condition_dim: 64
+  decoder:
+    hidden_dim: 128
+    num_layers: 2
+    remove_com_velocity: true
+  graph:
+    knn_k: 16
+    use_radius_cutoff: false
+    radius_cutoff: 12.0
+    num_rbf: 16
+    rbf_min_dist: 0.0
+    rbf_max_dist: 20.0
+
+flow:
+  path_type: linear
+  sigma_min: 0.0
+
+loss:
+  lambda_fm: 1.0
+  lambda_bond: 1.0
+  lambda_angle: 1.0
+  lambda_clash: 1.0
+  lambda_endpoint: 0.0
+  endpoint_enabled: false
+  physics:
+    enabled: true
+    apply_to: euler_step
+    step_scale: 1.0
+    d_ref_source: source
+    clash_threshold: 3.5
+    clash_seq_sep: 2
+
+train:
+  num_epochs: 2
+  max_steps: null
+  log_every: 10
+  val_every: 50
+  ckpt_dir: checkpoints
+  amp: false
+  device: cpu
+  seed: 0
+  overfit_one_batch: false
+  optim:
+    lr: 0.0003
+    weight_decay: 0.0001
+    grad_clip_norm: 1.0
+
+sampling:
+  num_steps: 50
+  solver: heun

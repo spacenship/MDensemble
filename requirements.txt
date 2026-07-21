@@ -1,0 +1,8 @@
+torch>=2.1
+numpy
+PyYAML
+pytest
+
+# Optional dependencies (not required for core functionality):
+# torch_scatter        # used for scatter-based aggregation if available; a pure-PyTorch fallback is always used otherwise
+# transformers          # only needed for the optional ESM embedding adapter
