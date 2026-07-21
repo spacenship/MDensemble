@@ -3,6 +3,7 @@ numpy
 PyYAML
 pytest
 
-# Optional dependencies (not required for core functionality):
+# Optional dependencies (not required for core functionality / the default synthetic pipeline):
 # torch_scatter        # used for scatter-based aggregation if available; a pure-PyTorch fallback is always used otherwise
 # transformers          # only needed for the optional ESM embedding adapter
+# h5py                 # only needed for MdCathDataset (data.source: mdcath)

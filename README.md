@@ -237,23 +237,59 @@ construction or flow matching:
 
 ## 10. Tensor schema for connecting real data (mdCATH / ATLAS)
 
-This repository does not assume mdCATH's on-disk format -- it only defines
-the tensor schema below and a synthetic dataset that satisfies it. We did
-verify (against a local sample file, `mdcath_dataset_1a87A01.h5`) that
-mdCATH HDF5 files store **all-atom** coordinates keyed by
-`<domain>/<temperature>/<replica>/coords` with shape
-`[num_frames, num_atoms, 3]` (e.g. 1607 atoms for a 97-residue domain, per
-`dssp`/`rmsf` array lengths) alongside `forces`, `rmsd`, `gyrationRadius`,
-and `dssp`. Extracting C-alpha-only coordinates from this requires a
-topology (atom -> residue/element mapping, typically a companion PDB/PSF
-file) that we did not inspect here -- do not assume a fixed atom-index
-formula for CA without checking that topology for the domains you use.
-ATLAS has its own, separately-documented layout and was not inspected at
-all for this project.
+This repository does not assume any on-disk format up front -- it defines
+the tensor schema below, a synthetic dataset that satisfies it, and (now)
+a real adapter for mdCATH, `protein_flow.data.mdcath.MdCathDataset`,
+verified against 100 real shards (`mdCATH_sample100/`, ~2,500
+domain/temperature/replica trajectories, lengths 53-479 residues).
 
-A real adapter should subclass `protein_flow.data.dataset.ProteinTrajectoryDataset`
-and, per `__getitem__`, return a dict matching exactly what
-`SyntheticProteinTrajectoryDataset` returns:
+What was actually verified by opening these files (not assumed):
+- Each shard is one CATH domain, with per-atom arrays `chain`, `element`,
+  `resid`, `resname`, `z` (length `numProteinAtoms`) describing the full
+  topology directly -- no separate PDB/PSF file is needed.
+- Each shard also embeds a full PDB-format text blob
+  (`pdbProteinAtoms`) whose ATOM records are in *exactly* the same
+  order as those per-atom arrays (checked: parsed resname/resid from this
+  text matched the arrays exactly on every file inspected). Fixed-column
+  PDB parsing (`parse_ca_indices_and_resnames`) extracts the true
+  C-alpha atom index per residue this way -- using the atom *name* field
+  ("CA"), not just element ("C"), so e.g. CHARMM's "CAY" N-terminal cap
+  atom is never confused with the alpha carbon. Sanity check: resulting
+  consecutive CA-CA distances average 3.83 A across sampled domains,
+  matching the known C-alpha virtual bond length.
+- Below the domain group, subgroups are keyed by simulation temperature
+  in Kelvin (`"320"`, `"348"`, `"379"`, `"413"`, `"450"` -- these are
+  literal group names in the file, not an assumption) each containing
+  replica subgroups (`"0"`..`"4"`) with a `coords` dataset of shape
+  `[num_frames, num_atoms, 3]`.
+
+What was **not** verified: the physical time gap between consecutive saved
+frames. There is no per-frame timestamp in these files, and external
+sources we checked disagreed with each other and with the frame counts we
+actually observed here. `MdCathDataset` therefore does not silently
+hard-code a nanosecond/picosecond value -- by default `physical_delta_t`
+is reported in raw frame-count units; pass `ps_per_frame=` (or
+`data.mdcath_ps_per_frame` in the YAML config) only once you've confirmed
+the correct value for your own mdCATH download.
+
+Run it with:
+```bash
+python train.py --config configs/mdcath.yaml
+```
+`configs/mdcath.yaml` points `data.mdcath_dir` at `mdCATH_sample100/data`
+(splits train/val **by domain** so no domain leaks across the split) and
+sets `data.source: mdcath`. `sequence_embedding` for real mdCATH samples is
+a deterministic per-domain placeholder unless `data.mdcath_embedding_cache_dir`
+points at cached `{domain}.pt` real PLM embedding tensors (`[L, plm_dim]`)
+you've precomputed yourself -- ESM is still never run automatically.
+
+ATLAS has its own, separately-documented layout and was not inspected at
+all for this project; connecting it would mean writing another adapter of
+the same shape as `MdCathDataset`.
+
+Any adapter -- real or synthetic -- just needs to subclass
+`protein_flow.data.dataset.ProteinTrajectoryDataset` and, per
+`__getitem__`, return a dict matching this schema:
 
 ```python
 {
@@ -271,19 +307,31 @@ and, per `__getitem__`, return a dict matching exactly what
 both graphs, flow matching, physics losses, sampling) only depends on this
 schema, not on any file format.
 
-### Optional ESM embedding adapter
+### ESM2 embedding adapter (implemented, opt-in)
 
-ESM itself is never run inside training or the test suite (no network/model
-download required). `protein_flow/data/synthetic.py` shows the expected
-shape; a real adapter would look like:
+`protein_flow/data/esm_adapter.py::compute_esm_embeddings` runs real
+`facebook/esm2_t6_8M_UR50D` (hidden size 320, matching `DataConfig.plm_dim`'s
+default) via `transformers` and returns one `[L, 320]` tensor per input
+sequence, special tokens and batch padding already stripped. **It is never
+imported by `train.py`, `sample.py`, or the test suite** -- ESM only runs
+when you explicitly invoke:
 
-```python
-# not part of the default training path -- illustrative only
-def compute_esm_embeddings(sequences: list[str]) -> list[torch.Tensor]:
-    import esm
-    model, alphabet = esm.pretrained.esm2_t12_35M_UR50D()
-    ...  # tokenize, forward pass, extract per-residue representations
+```bash
+python precompute_esm_embeddings.py \
+    --mdcath-dir mdCATH_sample100/data \
+    --output-dir esm_cache
 ```
+
+This parses each domain's embedded PDB text once (same code path as
+`MdCathDataset`) to get its one-letter sequence, runs ESM2 once per domain
+(not per frame -- the sequence is fixed across temperature/replica/frame),
+and writes `esm_cache/{domain}.pt`. Verified end-to-end on all 100
+`mdCATH_sample100` domains: 100 embeddings computed in ~7s on CPU (model
+weights cached locally after the first download), each with shape
+`[num_residues, 320]`. Point `data.mdcath_embedding_cache_dir` at that
+directory (already the default in `configs/mdcath.yaml`) and
+`MdCathDataset` loads the real embedding for every domain that has one,
+falling back to the placeholder only for domains missing from the cache.
 
 ## 11. Running it
 
@@ -292,6 +340,9 @@ pip install -r requirements.txt
 
 # Train on the synthetic dataset (CPU, a few seconds):
 python train.py --config configs/default.yaml
+
+# Train on real mdCATH shards instead (see Section 10):
+python train.py --config configs/mdcath.yaml
 
 # Sample from a trained checkpoint:
 python sample.py --checkpoint checkpoints/best.pt --num-steps 20 --solver heun
@@ -314,7 +365,7 @@ residue length variable in `[16, 48]`, padded to the batch max `L`):
 pytest -q
 ```
 
-64 tests cover: masked batched Kabsch alignment (including that internal
+76 tests cover: masked batched Kabsch alignment (including that internal
 deformation survives alignment while rigid transforms are undone), sparse
 sequence/geometric graph construction (padding, no cross-batch edges, safe
 `k > valid_residues`, radius cutoff), the flow path and flow-matching loss,
@@ -324,8 +375,13 @@ fusion + the full model, all physics losses, the Euler/Heun ODE solver
 (checked against analytic constant- and linear-velocity fields), the
 synthetic dataset + collate, a full training-loop smoke test (including an
 overfit-one-batch check that loss actually decreases), the dedicated
-full-model equivariance suite (`tests/test_equivariance.py`), and one
-end-to-end CPU smoke test wiring every stage together.
+full-model equivariance suite (`tests/test_equivariance.py`), one
+end-to-end CPU smoke test wiring every stage together, and (skipped
+automatically if `mdCATH_sample100/` isn't present on the machine) 9 tests
+against the real mdCATH adapter plus 3 offline tests of the ESM adapter's
+sequence-extraction logic (the actual `compute_esm_embeddings` model call
+is intentionally never exercised by the test suite, since it needs a
+network download).
 
 ## 13. Optional dependencies
 
@@ -333,3 +389,7 @@ end-to-end CPU smoke test wiring every stage together.
 pure-PyTorch fallback (`index_add_`-based) for every scatter-aggregation
 used in the sequence encoder, geometric encoder, and vector-field decoder,
 and uses `torch_scatter` automatically if it happens to be installed.
+
+`h5py` is only required if you use `data.source: mdcath`
+(`protein_flow/data/mdcath.py`) -- the default synthetic pipeline and the
+full test suite (aside from the auto-skipped mdCATH tests) never import it.

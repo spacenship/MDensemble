@@ -16,7 +16,13 @@ import yaml
 
 @dataclass
 class DataConfig:
-    """Describes the tensor schema and synthetic-data generation knobs."""
+    """Describes the tensor schema and synthetic-data generation knobs.
+
+    ``source`` selects between the synthetic dataset (default, always
+    runnable with no external files) and the real mdCATH HDF5 adapter
+    (:class:`protein_flow.data.mdcath.MdCathDataset`), configured via the
+    ``mdcath_*`` fields below.
+    """
 
     plm_dim: int = 320
     num_amino_acid_types: int = 22
@@ -27,6 +33,13 @@ class DataConfig:
     batch_size: int = 8
     num_workers: int = 0
     seed: int = 0
+
+    source: str = "synthetic"  # "synthetic" | "mdcath"
+    mdcath_dir: Optional[str] = None
+    mdcath_frame_gap: int = 1
+    mdcath_ps_per_frame: Optional[float] = None
+    mdcath_val_fraction: float = 0.15
+    mdcath_embedding_cache_dir: Optional[str] = None
 
 
 @dataclass

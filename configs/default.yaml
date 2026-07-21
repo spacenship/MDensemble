@@ -65,7 +65,7 @@ train:
   val_every: 50
   ckpt_dir: checkpoints
   amp: false
-  device: cpu
+  device: cuda
   seed: 0
   overfit_one_batch: false
   optim:

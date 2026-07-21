@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 checkpoints/
+checkpoints_mdcath/
 samples/
+esm_cache/
 .pytest_cache/
+log.txt

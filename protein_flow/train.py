@@ -30,7 +30,7 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def build_dataloaders(config: Config) -> tuple[DataLoader, DataLoader]:
+def _build_synthetic_dataloaders(config: Config) -> tuple[DataLoader, DataLoader]:
     train_dataset = SyntheticProteinTrajectoryDataset(config.data, size=config.data.train_size, seed=config.data.seed)
     val_dataset = SyntheticProteinTrajectoryDataset(
         config.data, size=config.data.val_size, seed=config.data.seed + 1
@@ -50,6 +50,56 @@ def build_dataloaders(config: Config) -> tuple[DataLoader, DataLoader]:
         collate_fn=collate_protein_batch,
     )
     return train_loader, val_loader
+
+
+def _build_mdcath_dataloaders(config: Config) -> tuple[DataLoader, DataLoader]:
+    from protein_flow.data.mdcath import MdCathDataset  # local import: h5py is an optional dependency
+
+    data_cfg = config.data
+    if not data_cfg.mdcath_dir:
+        raise ValueError("data.mdcath_dir must be set when data.source == 'mdcath'")
+
+    all_files = sorted(Path(data_cfg.mdcath_dir).glob("*.h5"))
+    if not all_files:
+        raise FileNotFoundError(f"No .h5 shards found under {data_cfg.mdcath_dir}")
+
+    # Split by domain (file), not by trajectory, so the same domain never
+    # leaks between train and val.
+    rng = random.Random(data_cfg.seed)
+    shuffled = list(all_files)
+    rng.shuffle(shuffled)
+    num_val = max(1, int(len(shuffled) * data_cfg.mdcath_val_fraction))
+    val_files, train_files = shuffled[:num_val], shuffled[num_val:]
+
+    common_kwargs = dict(
+        frame_gap=data_cfg.mdcath_frame_gap,
+        ps_per_frame=data_cfg.mdcath_ps_per_frame,
+        embedding_cache_dir=data_cfg.mdcath_embedding_cache_dir,
+    )
+    train_dataset = MdCathDataset(
+        data_cfg.mdcath_dir, data_cfg, h5_files=train_files, seed=data_cfg.seed, **common_kwargs
+    )
+    val_dataset = MdCathDataset(
+        data_cfg.mdcath_dir, data_cfg, h5_files=val_files, seed=data_cfg.seed + 1, **common_kwargs
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=data_cfg.batch_size, shuffle=True,
+        num_workers=data_cfg.num_workers, collate_fn=collate_protein_batch,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=data_cfg.batch_size, shuffle=False,
+        num_workers=data_cfg.num_workers, collate_fn=collate_protein_batch,
+    )
+    return train_loader, val_loader
+
+
+def build_dataloaders(config: Config) -> tuple[DataLoader, DataLoader]:
+    if config.data.source == "mdcath":
+        return _build_mdcath_dataloaders(config)
+    if config.data.source == "synthetic":
+        return _build_synthetic_dataloaders(config)
+    raise ValueError(f"Unknown data.source: {config.data.source!r}")
 
 
 def _move_batch_to_device(batch: Dict[str, Tensor], device: torch.device) -> Dict[str, Tensor]:

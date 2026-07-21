@@ -1,0 +1,94 @@
+# Real-data configuration: trains on actual mdCATH HDF5 shards instead of
+# the synthetic dataset. See protein_flow/data/mdcath.py for exactly what
+# was verified vs. assumed about the mdCATH file format.
+#
+# Usage:
+#   python train.py --config configs/mdcath.yaml
+
+data:
+  plm_dim: 320
+  num_amino_acid_types: 22
+  batch_size: 4
+  num_workers: 0
+  seed: 0
+
+  source: mdcath
+  mdcath_dir: /home/mipstu/wjYang/MolecularDynamics/mdCATH_sample100/data
+  # Frame gap between source/target within one trajectory. mdCATH stores no
+  # verified per-frame timestamp in these files (see mdcath.py docstring),
+  # so physical_delta_t is reported in raw frame-count units unless you set
+  # mdcath_ps_per_frame below to a value you have independently confirmed.
+  mdcath_frame_gap: 5
+  mdcath_ps_per_frame: null
+  mdcath_val_fraction: 0.15
+  # Directory of cached {domain}.pt real ESM2 embedding tensors, shape
+  # [L, plm_dim]. Generate with:
+  #   python precompute_esm_embeddings.py --mdcath-dir <mdcath_dir> --output-dir esm_cache
+  # Without this (or if a domain is missing from the cache), sequence_embedding
+  # falls back to a deterministic per-domain placeholder, NOT a real PLM
+  # embedding -- ESM is never run automatically during training/tests.
+  mdcath_embedding_cache_dir: esm_cache
+
+model:
+  sequence_encoder:
+    hidden_dim: 128
+    num_layers: 3
+    dropout: 0.1
+    use_position_encoding: true
+  geometric_encoder:
+    hidden_dim: 128
+    num_layers: 3
+    dropout: 0.1
+    update_coordinates: false
+  fusion:
+    hidden_dim: 128
+    condition_dim: 64
+  decoder:
+    hidden_dim: 128
+    num_layers: 2
+    remove_com_velocity: true
+  graph:
+    knn_k: 16
+    use_radius_cutoff: false
+    radius_cutoff: 12.0
+    num_rbf: 16
+    rbf_min_dist: 0.0
+    rbf_max_dist: 20.0
+
+flow:
+  path_type: linear
+  sigma_min: 0.0
+
+loss:
+  lambda_fm: 1.0
+  lambda_bond: 1.0
+  lambda_angle: 1.0
+  lambda_clash: 1.0
+  lambda_endpoint: 0.0
+  endpoint_enabled: false
+  physics:
+    enabled: true
+    apply_to: euler_step
+    step_scale: 1.0
+    d_ref_source: source
+    clash_threshold: 3.5
+    clash_seq_sep: 2
+
+train:
+  num_epochs: 2
+  max_steps: 100
+  log_every: 10
+  val_every: 50
+  ckpt_dir: checkpoints_mdcath
+  amp: false
+  device: cuda
+  seed: 0
+  overfit_one_batch: false
+  optim:
+    lr: 0.0003
+    weight_decay: 0.0001
+    grad_clip_norm: 1.0
+
+sampling:
+  num_steps: 50
+  solver: heun
