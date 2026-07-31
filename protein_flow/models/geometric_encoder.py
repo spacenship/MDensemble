@@ -1,4 +1,4 @@
-"""EGNN-style E(3)-equivariant geometric encoder.
+"""EGNN-style SE(3)-equivariant geometric encoder.
 
 Node hidden features produced by this module are rotation/translation
 **invariant** (they are built only from pairwise distances and other scalar
@@ -7,23 +7,41 @@ vector outputs are constructed downstream in
 :mod:`protein_flow.models.vector_field` by weighting the *relative*
 position vectors ``x_j - x_i`` with these invariant scalars -- this module
 never emits a raw xyz vector from an MLP.
+
+By default (``use_chirality_features=True``) the initial node features
+also include the signed backbone-dihedral pseudo-scalar from
+:mod:`protein_flow.geometry.chirality`, which is invariant under proper
+rotation + translation but flips sign under reflection. Without it, every
+feature used anywhere in this module is a true scalar (invariant under
+reflection too), which would make the network E(3)-equivariant -- unable
+to distinguish a structure from its mirror image, wrong for real chiral
+proteins. With it, the network is SE(3)-equivariant: equivariant under
+rotation + translation, but not under reflection.
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from protein_flow.geometry.chirality import compute_particle_dihedral
 from protein_flow.geometry.features import rbf_encode
 from protein_flow.geometry.graph import GeometricGraph, build_geometric_graph
-from protein_flow.utils import scatter_mean
+from protein_flow.utils import scatter_mean, sinusoidal_embedding
 
 
 def edge_scalar_dim(num_rbf: int) -> int:
-    """Dimensionality of [distance, rbf(distance), seq_sep_norm, peptide_indicator]."""
-    return 1 + num_rbf + 1 + 1
+    """Dimensionality of
+    [distance, rbf(distance), seq_sep_norm, peptide_indicator, same_residue_indicator].
+
+    ``same_residue_indicator`` is identically zero in the C-alpha
+    representation (one particle per residue) and only carries signal in
+    the all-atom representation, where it distinguishes intra-residue
+    edges from inter-residue contacts.
+    """
+    return 1 + num_rbf + 1 + 1 + 1
 
 
 def build_edge_scalar_features(graph: GeometricGraph, num_rbf: int, rbf_min_dist: float, rbf_max_dist: float) -> Tensor:
@@ -34,6 +52,7 @@ def build_edge_scalar_features(graph: GeometricGraph, num_rbf: int, rbf_min_dist
             rbf,
             graph.sequence_separation_norm.unsqueeze(-1),
             graph.peptide_neighbor_indicator.unsqueeze(-1),
+            graph.same_residue_indicator.unsqueeze(-1),
         ],
         dim=-1,
     )
@@ -120,9 +139,11 @@ class GeometricEncoder(nn.Module):
         num_rbf: int = 16,
         rbf_min_dist: float = 0.0,
         rbf_max_dist: float = 20.0,
+        use_chirality_features: bool = True,
         eps: float = 1e-8,
     ):
         super().__init__()
+        self.use_chirality_features = use_chirality_features
         self.knn_k = knn_k
         self.use_radius_cutoff = use_radius_cutoff
         self.radius_cutoff = radius_cutoff
@@ -131,6 +152,7 @@ class GeometricEncoder(nn.Module):
         self.rbf_max_dist = rbf_max_dist
         self.update_coordinates = update_coordinates
         self.eps = eps
+        self.hidden_dim = hidden_dim
         feature_dim = edge_scalar_dim(num_rbf)
         self.layers = nn.ModuleList(
             [EGNNLayer(hidden_dim, feature_dim, update_coordinates, dropout, eps) for _ in range(num_layers)]
@@ -141,15 +163,28 @@ class GeometricEncoder(nn.Module):
         coords: Tensor,
         node_features: Tensor,
         residue_mask: Tensor,
+        atom_residue_index: Optional[Tensor] = None,
+        ca_atom_index: Optional[Tensor] = None,
+        residue_level_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, GeometricGraph]:
         """
         Args:
-            coords: [B, L, 3] current (flow-time) C-alpha coordinates.
-            node_features: [B, L, hidden_dim] initial invariant node features.
-            residue_mask: [B, L] bool.
+            coords: [B, N, 3] current (flow-time) particle coordinates
+                (C-alpha atoms, or all heavy atoms in the all-atom mode).
+            node_features: [B, N, hidden_dim] initial invariant node features.
+            residue_mask: [B, N] bool validity of each *particle*.
+            atom_residue_index: [B, N] residue index per atom; all-atom only.
+            ca_atom_index: [B, L] atom index of each residue's CA; all-atom only.
+            residue_level_mask: [B, L] residue validity; all-atom only.
+
+        The three optional arguments are what turn this into an all-atom
+        encoder: they let sequence separation, peptide adjacency, and the
+        backbone chirality feature stay defined over *residues* even though
+        the nodes are now individual atoms. Omitting them recovers the
+        C-alpha behaviour exactly.
 
         Returns:
-            h_out: [B, L, hidden_dim] rotation/translation-invariant features.
+            h_out: [B, N, hidden_dim] rotation/translation-invariant features.
             graph: the :class:`GeometricGraph` built from the *input* coords
                 (used unchanged downstream by the vector-field decoder, even
                 if internal coordinate refinement is enabled).
@@ -157,9 +192,21 @@ class GeometricEncoder(nn.Module):
         batch_size, length, hidden_dim = node_features.shape
         num_nodes = batch_size * length
 
+        if self.use_chirality_features:
+            dihedral, valid = compute_particle_dihedral(
+                coords, residue_mask, ca_atom_index, atom_residue_index, residue_level_mask, eps=self.eps
+            )
+            chirality_embedding = sinusoidal_embedding(dihedral, hidden_dim) * valid.unsqueeze(-1).to(coords.dtype)
+            node_features = node_features + chirality_embedding
+
+        chain_length = None
+        if residue_level_mask is not None:
+            chain_length = residue_level_mask.sum(dim=1)
+
         graph = build_geometric_graph(
             coords, residue_mask, k=self.knn_k, use_radius_cutoff=self.use_radius_cutoff,
             radius_cutoff=self.radius_cutoff, eps=self.eps,
+            separation_index=atom_residue_index, chain_length=chain_length,
         )
 
         h_flat = node_features.reshape(num_nodes, hidden_dim)
@@ -182,6 +229,7 @@ class GeometricEncoder(nn.Module):
                         rbf_encode(distances, self.num_rbf, self.rbf_min_dist, self.rbf_max_dist),
                         graph.sequence_separation_norm.unsqueeze(-1),
                         graph.peptide_neighbor_indicator.unsqueeze(-1),
+                        graph.same_residue_indicator.unsqueeze(-1),
                     ],
                     dim=-1,
                 )

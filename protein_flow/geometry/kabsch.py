@@ -73,6 +73,36 @@ def masked_kabsch_align(
     """
     if source_coords.shape != target_coords.shape:
         raise ValueError("source_coords and target_coords must have the same shape")
+
+    # Kabsch alignment must run in at least float32, never in autocast's
+    # reduced precision: torch.linalg.svd has no half-precision CUDA kernel
+    # ("svd_cuda_gesvdjBatched not implemented for 'Half'"), and even where
+    # a half kernel exists, an SVD driving a rigid-body fit is exactly the
+    # kind of ill-conditioned op that should not be done in fp16. This is
+    # cheap no_grad preprocessing, so forcing full precision costs nothing
+    # meaningful. Results are cast back to the caller's dtype at the end.
+    input_dtype = source_coords.dtype
+    compute_dtype = torch.float64 if input_dtype == torch.float64 else torch.float32
+    with torch.autocast(device_type=source_coords.device.type, enabled=False):
+        result = _masked_kabsch_align_impl(
+            source_coords.to(compute_dtype), target_coords.to(compute_dtype), residue_mask, eps
+        )
+    return KabschResult(
+        aligned_target=result.aligned_target.to(input_dtype),
+        rotation=result.rotation.to(input_dtype),
+        translation=result.translation.to(input_dtype),
+        pre_rmsd=result.pre_rmsd.to(input_dtype),
+        post_rmsd=result.post_rmsd.to(input_dtype),
+    )
+
+
+def _masked_kabsch_align_impl(
+    source_coords: Tensor,
+    target_coords: Tensor,
+    residue_mask: Tensor,
+    eps: float,
+) -> KabschResult:
+    """Full-precision core of :func:`masked_kabsch_align` (see its docstring)."""
     mask = residue_mask.to(dtype=source_coords.dtype)  # [B, L]
     count = mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # [B, 1]
     mask_expanded = mask.unsqueeze(-1)  # [B, L, 1]

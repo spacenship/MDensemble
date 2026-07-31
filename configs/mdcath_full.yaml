@@ -1,4 +1,5 @@
-# Real-data configuration: trains on actual mdCATH HDF5 shards instead of
+# Full configuration: ~80M flow network + all-atom heavy atoms
+# + in-graph ESM2-150M fine-tuning + differentiable ODE unrolling. trains on actual mdCATH HDF5 shards instead of
 # the synthetic dataset. See protein_flow/data/mdcath.py for exactly what
 # was verified vs. assumed about the mdCATH file format.
 #
@@ -6,9 +7,13 @@
 #   python train.py --config configs/mdcath.yaml
 
 data:
-  plm_dim: 320
+  plm_dim: 640   # must equal the ESM2 checkpoint hidden size (esm2_t30_150M)
+  # Flow every non-hydrogen protein atom (~7.9 per residue) instead of one
+  # C-alpha per residue. Covalent bond/angle topology comes from each
+  # shard's CHARMM PSF (protein_flow/data/topology.py).
+  representation: heavy_atom
   num_amino_acid_types: 22
-  batch_size: 4
+  batch_size: 2   # all-atom graph + in-graph 150M PLM
   num_workers: 0
   seed: 0
 
@@ -34,34 +39,45 @@ data:
   # Without this (or if a domain is missing from the cache), sequence_embedding
   # falls back to a deterministic per-domain placeholder, NOT a real PLM
   # embedding -- ESM is never run automatically during training/tests.
-  mdcath_embedding_cache_dir: esm_cache
+  # Ignored while model.esm.enabled is true: embeddings are produced in-graph.
+  mdcath_embedding_cache_dir: null
 
 model:
   sequence_encoder:
-    hidden_dim: 128
-    num_layers: 3
+    hidden_dim: 1024
+    num_layers: 4
     dropout: 0.1
     use_position_encoding: true
   geometric_encoder:
-    hidden_dim: 128
-    num_layers: 3
+    hidden_dim: 1024
+    num_layers: 6
     dropout: 0.1
     update_coordinates: false
     use_chirality_features: true
   fusion:
-    hidden_dim: 128
-    condition_dim: 64
+    hidden_dim: 1024
+    condition_dim: 512
   decoder:
-    hidden_dim: 128
-    num_layers: 2
+    hidden_dim: 1024
+    num_layers: 3
     remove_com_velocity: true
   graph:
-    knn_k: 16
+    knn_k: 16   # atom neighbourhoods are dense; 16 already covers ~5 A
     use_radius_cutoff: false
     radius_cutoff: 12.0
-    num_rbf: 16
+    num_rbf: 32
     rbf_min_dist: 0.0
     rbf_max_dist: 20.0
+
+  esm:
+    enabled: true
+    model_name: facebook/esm2_t30_150M_UR50D
+    trainable: true
+    gradient_checkpointing: true
+    num_frozen_layers: 0
+    # Pretrained weights need a far gentler rate than the randomly
+    # initialised flow network (which uses train.optim.lr).
+    learning_rate: 1.0e-5
 
 flow:
   path_type: linear
@@ -72,23 +88,41 @@ loss:
   lambda_bond: 1.0
   lambda_angle: 1.0
   lambda_clash: 1.0
-  lambda_endpoint: 0.0
-  endpoint_enabled: false
+  lambda_endpoint: 0.1
+  endpoint_enabled: true
+  # Physics terms on the rollout endpoint, which is where straight-line
+  # Cartesian interpolation actually produces non-physical geometry.
+  endpoint_physics_enabled: true
+  lambda_endpoint_physics: 1.0
+  endpoint_rollout:
+    # Deliberately far smaller than sampling.num_steps (50): backprop
+    # through 50 evaluations of a 227M-parameter model is not tractable.
+    num_steps: 8
+    solver: euler
+    # Recomputes each step in the backward pass, making rollout activation
+    # memory flat in num_steps. Measured on this config: 8 steps OOMs with
+    # this off, and costs ~27 GB with it on.
+    gradient_checkpointing: true
+    backprop_last_steps: null
   physics:
     enabled: true
     apply_to: euler_step
     step_scale: 1.0
     d_ref_source: source
-    clash_threshold: 3.5
-    clash_seq_sep: 2
+    clash_threshold: 3.5      # C-alpha representation only
+    clash_seq_sep: 2          # C-alpha representation only
+    # Used in heavy_atom mode. Measured on real mdCATH frames: no non-bonded
+    # heavy-atom pair (excluding 1-2/1-3 covalent neighbours) is closer than
+    # 2.51 A, so this penalizes only genuinely non-physical overlap.
+    clash_threshold_heavy_atom: 2.5
 
 train:
   num_epochs: 100
-  max_steps: null
+  max_steps: null   # set via --max-steps override for smoke tests
   log_every: 100
   val_every: 2000
-  ckpt_dir: checkpoints_mdcath
-  amp: false
+  ckpt_dir: checkpoints_mdcath_full
+  amp: true
   device: cuda
   seed: 0
   overfit_one_batch: false

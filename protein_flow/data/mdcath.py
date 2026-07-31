@@ -41,7 +41,8 @@ import torch
 
 from protein_flow.config import DataConfig
 from protein_flow.data.dataset import ProteinTrajectoryDataset
-from protein_flow.data.residue_vocab import resname_to_index
+from protein_flow.data.residue_vocab import resname_to_index, resname_to_one_letter
+from protein_flow.data.topology import AtomTopology, parse_heavy_atom_topology
 
 logger = logging.getLogger(__name__)
 
@@ -94,20 +95,43 @@ class MdCathDataset(ProteinTrajectoryDataset):
         data_config: DataConfig,
         h5_files: Optional[List[Path]] = None,
         frame_gap: int = 1,
+        sampling_max_frame_gap: Optional[int] = None,
         ps_per_frame: Optional[float] = None,
         embedding_cache_dir: Optional[str | Path] = None,
         seed: int = 0,
+        pairs_per_trajectory: int = 1,
+        resample_each_epoch: bool = False,
+        representation: str = "ca",
+        esm_tokenizer_name: Optional[str] = None,
     ):
         if not _HAS_H5PY:
             raise ImportError("MdCathDataset requires h5py: pip install h5py")
+        if representation not in ("ca", "heavy_atom"):
+            raise ValueError(f"representation must be 'ca' or 'heavy_atom', got {representation!r}")
         if frame_gap < 1:
             raise ValueError("frame_gap must be >= 1")
+        if sampling_max_frame_gap is not None and sampling_max_frame_gap < frame_gap:
+            raise ValueError("sampling_max_frame_gap must be >= frame_gap")
+        if pairs_per_trajectory < 1:
+            raise ValueError("pairs_per_trajectory must be >= 1")
 
         self.data_config = data_config
+        self.representation = representation
         self.frame_gap = frame_gap
+        self.sampling_max_frame_gap = sampling_max_frame_gap or frame_gap
         self.ps_per_frame = ps_per_frame
         self.seed = seed
+        self.pairs_per_trajectory = pairs_per_trajectory
+        self.resample_each_epoch = resample_each_epoch
+        self.epoch = 0
         self.embedding_cache_dir = Path(embedding_cache_dir) if embedding_cache_dir else None
+        self._embedding_memory_cache: Dict[str, torch.Tensor] = {}
+
+        # In-graph ESM fine-tuning needs token ids rather than precomputed
+        # vectors. Each domain's sequence is fixed, so tokenize once and cache.
+        self.esm_tokenizer_name = esm_tokenizer_name
+        self._esm_tokenizer = None
+        self._token_cache: Dict[str, torch.Tensor] = {}
 
         if h5_files is None:
             h5_files = sorted(Path(data_dir).glob("*.h5"))
@@ -115,6 +139,8 @@ class MdCathDataset(ProteinTrajectoryDataset):
             raise FileNotFoundError(f"No .h5 files found under {data_dir}")
 
         self._domain_meta: Dict[str, Tuple[np.ndarray, torch.Tensor, int]] = {}
+        self._domain_topology: Dict[str, "AtomTopology"] = {}
+        self._domain_residue_names: Dict[str, List[str]] = {}
         self.trajectory_index: List[Dict[str, Any]] = []
 
         for path in h5_files:
@@ -136,6 +162,22 @@ class MdCathDataset(ProteinTrajectoryDataset):
                 ca_indices, residue_names = parse_ca_indices_and_resnames(pdb_bytes)
                 residue_types = torch.tensor([resname_to_index(r) for r in residue_names], dtype=torch.long)
                 self._domain_meta[domain] = (ca_indices, residue_types, len(ca_indices))
+                self._domain_residue_names[domain] = residue_names
+
+                if self.representation == "heavy_atom":
+                    topology = parse_heavy_atom_topology(
+                        group["psf"][()],
+                        np.asarray([e.decode() for e in group["element"][:]]),
+                        group["resid"][:],
+                        np.asarray([r.decode() for r in group["resname"][:]]),
+                        int(group.attrs["numProteinAtoms"]),
+                    )
+                    if topology.num_residues != len(ca_indices):
+                        raise ValueError(
+                            f"{domain}: PSF topology has {topology.num_residues} residues but the "
+                            f"embedded PDB has {len(ca_indices)}"
+                        )
+                    self._domain_topology[domain] = topology
 
             for key in group.keys():
                 if key in _NON_TRAJECTORY_KEYS:
@@ -143,7 +185,7 @@ class MdCathDataset(ProteinTrajectoryDataset):
                 temperature_group = group[key]
                 for replica_key in temperature_group.keys():
                     num_frames = int(temperature_group[replica_key].attrs["numFrames"])
-                    if num_frames > self.frame_gap:
+                    if num_frames > self.sampling_max_frame_gap:
                         self.trajectory_index.append(
                             {
                                 "path": path,
@@ -155,14 +197,28 @@ class MdCathDataset(ProteinTrajectoryDataset):
                         )
 
     def __len__(self) -> int:
-        return len(self.trajectory_index)
+        return len(self.trajectory_index) * self.pairs_per_trajectory
+
+    def set_epoch(self, epoch: int) -> None:
+        """Select the deterministic frame-pair schedule for one epoch.
+
+        Training datasets include ``epoch`` in the local RNG seed so a
+        trajectory exposes fresh offsets on every pass. Validation datasets
+        ignore it and therefore remain fixed across repeated evaluations.
+        """
+        if epoch < 0:
+            raise ValueError("epoch must be >= 0")
+        self.epoch = epoch
 
     def _load_or_make_embedding(self, domain: str, length: int) -> torch.Tensor:
+        if domain in self._embedding_memory_cache:
+            return self._embedding_memory_cache[domain]
         if self.embedding_cache_dir is not None:
             cached_path = self.embedding_cache_dir / f"{domain}.pt"
             if cached_path.exists():
                 embedding = torch.load(cached_path, map_location="cpu")
                 if tuple(embedding.shape) == (length, self.data_config.plm_dim):
+                    self._embedding_memory_cache[domain] = embedding
                     return embedding
                 logger.warning(
                     "Cached embedding for %s has shape %s, expected (%d, %d); falling back to placeholder.",
@@ -170,15 +226,48 @@ class MdCathDataset(ProteinTrajectoryDataset):
                 )
         domain_seed = self.seed + sum(ord(c) for c in domain)
         local_generator = torch.Generator().manual_seed(domain_seed)
-        return torch.randn(length, self.data_config.plm_dim, generator=local_generator)
+        embedding = torch.randn(length, self.data_config.plm_dim, generator=local_generator)
+        self._embedding_memory_cache[domain] = embedding
+        return embedding
+
+    def _domain_token_ids(self, domain: str) -> torch.Tensor:
+        """Token ids for a domain's sequence, computed once and cached."""
+        if domain in self._token_cache:
+            return self._token_cache[domain]
+        if self._esm_tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._esm_tokenizer = AutoTokenizer.from_pretrained(self.esm_tokenizer_name)
+        sequence = "".join(resname_to_one_letter(r) for r in self._domain_residue_names[domain])
+        encoded = self._esm_tokenizer(sequence, return_tensors="pt")
+        token_ids = encoded["input_ids"][0]
+        self._token_cache[domain] = token_ids
+        return token_ids
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        entry = self.trajectory_index[index]
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        trajectory_index = index // self.pairs_per_trajectory
+        pair_index = index % self.pairs_per_trajectory
+        entry = self.trajectory_index[trajectory_index]
         ca_indices, residue_types, length = self._domain_meta[entry["domain"]]
 
-        generator = torch.Generator().manual_seed(self.seed * 1_000_003 + index)
-        max_start = entry["num_frames"] - self.frame_gap - 1
-        source_frame = int(torch.randint(0, max_start + 1, (1,), generator=generator).item())
+        epoch = self.epoch if self.resample_each_epoch else 0
+        max_start = entry["num_frames"] - self.sampling_max_frame_gap - 1
+        if not self.resample_each_epoch and self.pairs_per_trajectory > 1:
+            # Fixed quantile centres give validation broad, reproducible
+            # trajectory coverage without depending on an arbitrary RNG draw.
+            source_frame = int((pair_index + 0.5) * (max_start + 1) / self.pairs_per_trajectory)
+            source_frame = min(source_frame, max_start)
+        else:
+            frame_seed = (
+                self.seed * 1_000_003
+                + epoch * 10_000_019
+                + trajectory_index * 10_007
+                + pair_index * 101
+            )
+            generator = torch.Generator().manual_seed(frame_seed)
+            source_frame = int(torch.randint(0, max_start + 1, (1,), generator=generator).item())
         target_frame = source_frame + self.frame_gap
 
         with h5py.File(entry["path"], "r") as f:
@@ -186,8 +275,16 @@ class MdCathDataset(ProteinTrajectoryDataset):
             source_full = coords_dataset[source_frame]
             target_full = coords_dataset[target_frame]
 
-        source_coords = torch.from_numpy(np.asarray(source_full[ca_indices], dtype=np.float32))
-        target_coords = torch.from_numpy(np.asarray(target_full[ca_indices], dtype=np.float32))
+        # In "ca" mode the flowing particles are the C-alpha atoms; in
+        # "heavy_atom" mode they are every non-hydrogen protein atom.
+        if self.representation == "heavy_atom":
+            topology = self._domain_topology[entry["domain"]]
+            particle_indices = topology.heavy_indices
+        else:
+            particle_indices = ca_indices
+
+        source_coords = torch.from_numpy(np.asarray(source_full[particle_indices], dtype=np.float32))
+        target_coords = torch.from_numpy(np.asarray(target_full[particle_indices], dtype=np.float32))
 
         temperature_value = float(entry["temperature"])  # verified: this key IS the simulation temperature in Kelvin
         if self.ps_per_frame is not None:
@@ -195,7 +292,7 @@ class MdCathDataset(ProteinTrajectoryDataset):
         else:
             delta_t_value = float(self.frame_gap)  # raw frame-count units; see module docstring
 
-        return {
+        sample = {
             "sequence_embedding": self._load_or_make_embedding(entry["domain"], length),
             "source_coords": source_coords,
             "target_coords": target_coords,
@@ -203,3 +300,15 @@ class MdCathDataset(ProteinTrajectoryDataset):
             "temperature": torch.tensor([temperature_value]),
             "physical_delta_t": torch.tensor([delta_t_value]),
         }
+        if self.esm_tokenizer_name is not None:
+            sample["esm_input_ids"] = self._domain_token_ids(entry["domain"])
+        if self.representation == "heavy_atom":
+            topology = self._domain_topology[entry["domain"]]
+            sample.update(
+                atom_residue_index=torch.from_numpy(topology.atom_residue_index),
+                atom_element=torch.from_numpy(topology.atom_element),
+                ca_atom_index=torch.from_numpy(topology.ca_atom_index),
+                bond_index=torch.from_numpy(topology.bond_index),
+                angle_index=torch.from_numpy(topology.angle_index),
+            )
+        return sample

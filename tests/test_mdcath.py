@@ -92,6 +92,38 @@ def test_deterministic_given_seed_and_index():
     torch.testing.assert_close(sample_a["target_coords"], sample_b["target_coords"])
 
 
+def test_pairs_per_trajectory_expands_dataset():
+    single = _make_dataset(frame_gap=5, pairs_per_trajectory=1)
+    multiple = _make_dataset(frame_gap=5, pairs_per_trajectory=4)
+    assert len(multiple) == 4 * len(single)
+
+
+def test_training_frame_pairs_change_with_epoch():
+    dataset = _make_dataset(frame_gap=5, resample_each_epoch=True)
+    dataset.set_epoch(0)
+    source_epoch_zero = dataset[10]["source_coords"]
+    sources = []
+    for epoch in range(1, 5):
+        dataset.set_epoch(epoch)
+        sources.append(dataset[10]["source_coords"])
+    assert any(not torch.equal(source_epoch_zero, source) for source in sources)
+
+
+def test_validation_frame_pairs_ignore_epoch():
+    dataset = _make_dataset(frame_gap=5, pairs_per_trajectory=3, resample_each_epoch=False)
+    source_epoch_zero = dataset[11]["source_coords"]
+    dataset.set_epoch(99)
+    torch.testing.assert_close(source_epoch_zero, dataset[11]["source_coords"])
+
+
+def test_sampling_max_gap_keeps_sources_paired_across_gap_ablations():
+    gap_one = _make_dataset(frame_gap=1, sampling_max_frame_gap=5)
+    gap_five = _make_dataset(frame_gap=5, sampling_max_frame_gap=5)
+    for index in (0, 10, 100):
+        torch.testing.assert_close(gap_one[index]["source_coords"], gap_five[index]["source_coords"])
+        assert not torch.equal(gap_one[index]["target_coords"], gap_five[index]["target_coords"])
+
+
 def test_ps_per_frame_scales_physical_delta_t():
     dataset = _make_dataset(frame_gap=4, ps_per_frame=10.0)
     sample = dataset[0]

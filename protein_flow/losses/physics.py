@@ -146,3 +146,161 @@ def endpoint_rmsd_loss(rollout_coords: Tensor, aligned_target: Tensor, residue_m
     count = mask.sum(dim=1).clamp(min=1.0)
     mean_squared = (squared_dist * mask).sum(dim=1) / count
     return torch.sqrt(mean_squared + eps).mean()
+
+
+# --- All-atom (topology-driven) physics losses -------------------------------
+#
+# The C-alpha losses above define "bonded" as "adjacent in sequence", which is
+# only meaningful when one particle == one residue. An all-atom structure has
+# branched side chains whose connectivity cannot be read off atom ordering, so
+# these variants take the real CHARMM covalent topology (bond/angle index
+# tensors from protein_flow/data/topology.py) instead.
+
+
+def topology_bond_loss(
+    pred_coords: Tensor,
+    reference_coords: Tensor,
+    bond_index: Tensor,
+    bond_mask: Tensor,
+) -> Tensor:
+    """Masked MSE between predicted and reference covalent bond lengths.
+
+    Args:
+        pred_coords: [B, N, 3] structure the loss is applied to.
+        reference_coords: [B, N, 3] structure supplying target bond lengths.
+        bond_index: [B, E, 2] atom indices of each covalent bond.
+        bond_mask: [B, E] bool, True for real (non-padding) bonds.
+    """
+    if bond_index.shape[1] == 0:
+        return pred_coords.new_zeros(())
+    i, j = bond_index[..., 0], bond_index[..., 1]
+    pred_lengths = _gathered_distance(pred_coords, i, j)
+    with torch.no_grad():
+        reference_lengths = _gathered_distance(reference_coords, i, j)
+    return masked_mean((pred_lengths - reference_lengths) ** 2, bond_mask)
+
+
+def topology_angle_loss(
+    pred_coords: Tensor,
+    reference_coords: Tensor,
+    angle_index: Tensor,
+    angle_mask: Tensor,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Masked MSE between predicted and reference covalent bond-angle cosines.
+
+    Args:
+        angle_index: [B, E, 3] atom indices (i, centre, k) of each covalent angle.
+        angle_mask: [B, E] bool, True for real angles.
+    """
+    if angle_index.shape[1] == 0:
+        return pred_coords.new_zeros(())
+    i, centre, k = angle_index[..., 0], angle_index[..., 1], angle_index[..., 2]
+    pred_cos = _gathered_cosine(pred_coords, i, centre, k, eps)
+    with torch.no_grad():
+        reference_cos = _gathered_cosine(reference_coords, i, centre, k, eps)
+    return masked_mean((pred_cos - reference_cos) ** 2, angle_mask)
+
+
+def _gathered_distance(coords: Tensor, i: Tensor, j: Tensor) -> Tensor:
+    xi = torch.gather(coords, 1, i.unsqueeze(-1).expand(-1, -1, 3))
+    xj = torch.gather(coords, 1, j.unsqueeze(-1).expand(-1, -1, 3))
+    return (xi - xj).norm(dim=-1)
+
+
+def _gathered_cosine(coords: Tensor, i: Tensor, centre: Tensor, k: Tensor, eps: float) -> Tensor:
+    xi = torch.gather(coords, 1, i.unsqueeze(-1).expand(-1, -1, 3))
+    xc = torch.gather(coords, 1, centre.unsqueeze(-1).expand(-1, -1, 3))
+    xk = torch.gather(coords, 1, k.unsqueeze(-1).expand(-1, -1, 3))
+    v1, v2 = xi - xc, xk - xc
+    return (v1 * v2).sum(dim=-1) / (v1.norm(dim=-1) * v2.norm(dim=-1) + eps)
+
+
+def _covalent_exclusion_keys(
+    bond_index: Tensor, bond_mask: Tensor, angle_index: Tensor, angle_mask: Tensor, num_atoms: int
+) -> Tensor:
+    """Sorted int64 keys of all atom pairs that must be exempt from the clash
+    penalty: 1-2 (bonded) and 1-3 (angle end) pairs, which are legitimately
+    much closer than any non-bonded contact."""
+    batch_size = bond_index.shape[0]
+    device = bond_index.device
+    batch_offset = torch.arange(batch_size, device=device).view(-1, 1) * num_atoms * num_atoms
+
+    def to_keys(a: Tensor, b: Tensor, mask: Tensor) -> Tensor:
+        low = torch.minimum(a, b)
+        high = torch.maximum(a, b)
+        keys = batch_offset + low * num_atoms + high
+        return keys[mask]
+
+    parts = [to_keys(bond_index[..., 0], bond_index[..., 1], bond_mask)]
+    if angle_index.shape[1] > 0:
+        # (i, centre, k): all three pairs are within one or two bonds.
+        parts.append(to_keys(angle_index[..., 0], angle_index[..., 2], angle_mask))
+        parts.append(to_keys(angle_index[..., 0], angle_index[..., 1], angle_mask))
+        parts.append(to_keys(angle_index[..., 1], angle_index[..., 2], angle_mask))
+    return torch.unique(torch.cat(parts)) if parts else torch.zeros(0, dtype=torch.long, device=device)
+
+
+def topology_clash_loss(
+    pred_coords: Tensor,
+    atom_mask: Tensor,
+    graph_config: GraphConfig,
+    clash_threshold: float,
+    bond_index: Tensor,
+    bond_mask: Tensor,
+    angle_index: Tensor,
+    angle_mask: Tensor,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Steric-clash penalty over the sparse k-NN graph, excluding covalently
+    close (1-2 and 1-3) atom pairs.
+
+    ``clash_threshold`` should be set for the representation in use: measured
+    on real mdCATH frames, no non-bonded heavy-atom pair comes closer than
+    2.51 A, whereas C-alpha-only pairs are separated by much more.
+    """
+    graph = build_geometric_graph(
+        pred_coords, atom_mask, k=graph_config.knn_k,
+        use_radius_cutoff=graph_config.use_radius_cutoff,
+        radius_cutoff=graph_config.radius_cutoff, eps=eps,
+    )
+    if graph.edge_index.shape[1] == 0:
+        return pred_coords.new_zeros(())
+
+    num_atoms = pred_coords.shape[1]
+    src, dst = graph.edge_index
+    batch_of_edge = src // num_atoms
+    local_src, local_dst = src % num_atoms, dst % num_atoms
+    low = torch.minimum(local_src, local_dst)
+    high = torch.maximum(local_src, local_dst)
+    edge_keys = batch_of_edge * num_atoms * num_atoms + low * num_atoms + high
+
+    excluded = _covalent_exclusion_keys(bond_index, bond_mask, angle_index, angle_mask, num_atoms)
+    keep = ~torch.isin(edge_keys, excluded)
+    if not torch.any(keep):
+        return pred_coords.new_zeros(())
+
+    penalty = torch.relu(clash_threshold - graph.distances[keep]) ** 2
+    return penalty.mean()
+
+
+def compute_all_atom_physics_losses(
+    pred_coords: Tensor,
+    reference_coords: Tensor,
+    atom_mask: Tensor,
+    bond_index: Tensor,
+    bond_mask: Tensor,
+    angle_index: Tensor,
+    angle_mask: Tensor,
+    graph_config: GraphConfig,
+    clash_threshold: float,
+) -> PhysicsLossOutputs:
+    """All-atom counterpart of :func:`compute_physics_losses`."""
+    return PhysicsLossOutputs(
+        bond=topology_bond_loss(pred_coords, reference_coords, bond_index, bond_mask),
+        angle=topology_angle_loss(pred_coords, reference_coords, angle_index, angle_mask),
+        clash=topology_clash_loss(
+            pred_coords, atom_mask, graph_config, clash_threshold,
+            bond_index, bond_mask, angle_index, angle_mask,
+        ),
+    )

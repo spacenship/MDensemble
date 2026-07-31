@@ -30,21 +30,27 @@ def integrate_ode(
     num_steps: int = 50,
     solver: str = "heun",
     return_trajectory: bool = False,
+    **atom_inputs: Tensor,
 ) -> Tuple[Tensor, Tensor]:
     """Integrate the flow ODE from tau=0 (x0) to tau=1.
 
     Args:
         model: a DualGraphFlowModel-like module callable as
             ``model(x_tau, tau, sequence_embedding, residue_types,
-            temperature, physical_delta_t, residue_mask)``.
-        x0: [B, L, 3] initial coordinates.
+            temperature, physical_delta_t, residue_mask, **atom_inputs)``.
+        x0: [B, N, 3] initial coordinates.
         num_steps: number of integration steps.
         solver: "euler" or "heun".
         return_trajectory: if True, also returns intermediate states.
+        **atom_inputs: optional all-atom tensors (``atom_mask``,
+            ``atom_residue_index``, ``atom_element``, ``ca_atom_index``)
+            forwarded unchanged to every velocity evaluation. They describe
+            fixed topology, so unlike the coordinates they do not change
+            along the trajectory.
 
     Returns:
-        final_coords: [B, L, 3].
-        trajectory: [num_steps + 1, B, L, 3] if ``return_trajectory`` else
+        final_coords: [B, N, 3].
+        trajectory: [num_steps + 1, B, N, 3] if ``return_trajectory`` else
             a tensor containing only the final state stacked once.
     """
     if solver not in ("euler", "heun"):
@@ -64,7 +70,10 @@ def integrate_ode(
         tau_end = tau_start + dtau
 
         tau_batch_start = _make_tau_batch(batch_size, tau_start, device, dtype)
-        v0 = model(x, tau_batch_start, sequence_embedding, residue_types, temperature, physical_delta_t, residue_mask)
+        v0 = model(
+            x, tau_batch_start, sequence_embedding, residue_types,
+            temperature, physical_delta_t, residue_mask, **atom_inputs,
+        )
 
         if solver == "euler":
             x = x + dtau * v0
@@ -72,7 +81,8 @@ def integrate_ode(
             x_euler = x + dtau * v0
             tau_batch_end = _make_tau_batch(batch_size, tau_end, device, dtype)
             v1 = model(
-                x_euler, tau_batch_end, sequence_embedding, residue_types, temperature, physical_delta_t, residue_mask
+                x_euler, tau_batch_end, sequence_embedding, residue_types,
+                temperature, physical_delta_t, residue_mask, **atom_inputs,
             )
             x = x + dtau * 0.5 * (v0 + v1)
 

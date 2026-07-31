@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""CLI entry point: python train.py --config configs/default.yaml"""
+"""CLI entry point.
+
+Single GPU:
+    python train.py --config configs/default.yaml
+
+Multiple GPUs (DistributedDataParallel, one process per GPU):
+    torchrun --nproc_per_node=2 train.py --config configs/mdcath_full.yaml
+
+The same script serves both: `protein_flow.distributed.setup_distributed`
+detects the environment variables torchrun sets and initialises the process
+group only when they are present.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +18,7 @@ import logging
 from pathlib import Path
 
 from protein_flow.config import load_config
+from protein_flow.distributed import get_rank, is_torchrun_launch
 from protein_flow.train import train
 
 
@@ -15,7 +27,17 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to a YAML config file.")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    # Tag every line with its rank under torchrun, and keep non-zero ranks
+    # quiet so the log stays readable (they would otherwise duplicate
+    # warnings verbatim).
+    if is_torchrun_launch():
+        rank = get_rank()
+        logging.basicConfig(
+            level=logging.INFO if rank == 0 else logging.WARNING,
+            format=f"%(asctime)s | %(levelname)s | [rank {rank}] %(message)s",
+        )
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     config = load_config(args.config)
     ckpt_dir = Path(config.train.ckpt_dir)

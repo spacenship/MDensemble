@@ -113,3 +113,33 @@ def test_det_always_positive_even_with_reflection_prone_data():
     result = masked_kabsch_align(source, target, mask)
     dets = torch.det(result.rotation)
     torch.testing.assert_close(dets, torch.ones_like(dets), atol=1e-3, rtol=1e-3)
+
+
+def test_runs_under_autocast_and_half_precision():
+    """Regression: torch.linalg.svd has no half-precision CUDA kernel, so a
+    naive implementation crashes with
+    'svd_cuda_gesvdjBatched not implemented for Half' as soon as AMP is
+    enabled. Alignment must force full precision internally instead."""
+    gen = torch.Generator().manual_seed(7)
+    batch, length = 3, 20
+    source = torch.randn(batch, length, 3, generator=gen)
+    rotation_true = _random_rotation(batch, gen)
+    translation_true = torch.randn(batch, 3, generator=gen)
+    target = torch.einsum("bli,bij->blj", source, rotation_true) + translation_true.unsqueeze(1)
+    mask = torch.ones(batch, length, dtype=torch.bool)
+
+    devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+    for device in devices:
+        src, tgt, msk = source.to(device), target.to(device), mask.to(device)
+        with torch.autocast(device_type=device, enabled=True):
+            result = masked_kabsch_align(src, tgt, msk)
+        assert torch.isfinite(result.aligned_target).all()
+        dets = torch.det(result.rotation.float())
+        torch.testing.assert_close(dets, torch.ones_like(dets), atol=1e-3, rtol=1e-3)
+        assert result.post_rmsd.float().max() < 1e-2
+
+        # Explicitly half-precision inputs must also work and stay in dtype.
+        if device == "cuda":
+            half_result = masked_kabsch_align(src.half(), tgt.half(), msk)
+            assert half_result.aligned_target.dtype == torch.float16
+            assert torch.isfinite(half_result.aligned_target).all()

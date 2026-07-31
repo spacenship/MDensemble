@@ -1,4 +1,4 @@
-# Real-data configuration: trains on actual mdCATH HDF5 shards instead of
+# Scaled (~80M parameter) real-data configuration: trains on actual mdCATH HDF5 shards instead of
 # the synthetic dataset. See protein_flow/data/mdcath.py for exactly what
 # was verified vs. assumed about the mdCATH file format.
 #
@@ -8,7 +8,7 @@
 data:
   plm_dim: 320
   num_amino_acid_types: 22
-  batch_size: 4
+  batch_size: 32
   num_workers: 0
   seed: 0
 
@@ -38,28 +38,28 @@ data:
 
 model:
   sequence_encoder:
-    hidden_dim: 128
-    num_layers: 3
+    hidden_dim: 1024
+    num_layers: 4
     dropout: 0.1
     use_position_encoding: true
   geometric_encoder:
-    hidden_dim: 128
-    num_layers: 3
+    hidden_dim: 1024
+    num_layers: 6
     dropout: 0.1
     update_coordinates: false
     use_chirality_features: true
   fusion:
-    hidden_dim: 128
-    condition_dim: 64
+    hidden_dim: 1024
+    condition_dim: 512
   decoder:
-    hidden_dim: 128
-    num_layers: 2
+    hidden_dim: 1024
+    num_layers: 3
     remove_com_velocity: true
   graph:
-    knn_k: 16
+    knn_k: 32
     use_radius_cutoff: false
     radius_cutoff: 12.0
-    num_rbf: 16
+    num_rbf: 32
     rbf_min_dist: 0.0
     rbf_max_dist: 20.0
 
@@ -84,11 +84,11 @@ loss:
 
 train:
   num_epochs: 100
-  max_steps: null
+  max_steps: null   # set via --max-steps override for smoke tests
   log_every: 100
   val_every: 2000
-  ckpt_dir: checkpoints_mdcath
-  amp: false
+  ckpt_dir: checkpoints_mdcath_large
+  amp: true
   device: cuda
   seed: 0
   overfit_one_batch: false

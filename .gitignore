@@ -6,3 +6,8 @@ samples/
 esm_cache/
 .pytest_cache/
 log.txt
+logs/
+checkpoints_mdcath_all_atom/
+checkpoints_mdcath_esm/
+checkpoints_mdcath_full/
+checkpoints_mdcath_large/

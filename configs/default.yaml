@@ -24,6 +24,7 @@ model:
     num_layers: 3
     dropout: 0.1
     update_coordinates: false
+    use_chirality_features: true
   fusion:
     hidden_dim: 128
     condition_dim: 64
@@ -68,10 +69,18 @@ train:
   device: cuda
   seed: 0
   overfit_one_batch: false
+  val_tau_values: [0.2, 0.5, 0.8]
+  val_endpoint_enabled: false
+  val_endpoint_num_steps: 10
+  val_endpoint_max_batches: 10
+  val_endpoint_solver: heun
   optim:
     lr: 0.0003
     weight_decay: 0.0001
     grad_clip_norm: 1.0
+    plateau_factor: 0.5
+    plateau_patience: 3
+    min_lr: 0.000001
 
 sampling:
   num_steps: 50

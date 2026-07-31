@@ -1,0 +1,8 @@
+# Short-horizon ablation. All unspecified values come from ../mdcath.yaml.
+base_config: ../mdcath.yaml
+
+data:
+  mdcath_frame_gap: 1
+
+train:
+  ckpt_dir: checkpoints_mdcath_gap1
