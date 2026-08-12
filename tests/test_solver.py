@@ -106,3 +106,42 @@ def test_invalid_solver_raises():
     seq_emb, residue_types, mask, temperature, delta_t = _dummy_conditions(1, 3)
     with pytest.raises(ValueError):
         integrate_ode(model, x0, seq_emb, residue_types, mask, temperature, delta_t, solver="rk4")
+
+
+def test_the_field_is_never_queried_at_tau_one():
+    """Heun's corrector lands on tau=1 exactly, where the learned field is wild.
+
+    Training samples tau ~ Uniform(0, 1), which never yields 1.0, and a
+    mid-training checkpoint measured flow-matching error 1464 there against
+    20.3 at tau=0.99, with the predicted velocity 2.8x too large. Measured,
+    the guard changes no sampled structure -- the spike does not survive its
+    ``dtau/2`` weight -- so this pins an invariant, not a result: the field is
+    only ever asked about the interval it was fitted on.
+    """
+    import torch
+
+    from protein_flow.flow.solver import TAU_QUERY_LIMIT, integrate_ode
+
+    seen = []
+
+    class RecordingField(torch.nn.Module):
+        def forward(self, x, tau, *args, **kwargs):
+            seen.append(float(tau.max()))
+            return torch.zeros_like(x)
+
+    x0 = torch.zeros(2, 5, 3)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    integrate_ode(
+        RecordingField(), x0, torch.zeros(2, 5, 4), torch.zeros(2, 5, dtype=torch.long),
+        mask, torch.zeros(2, 1), torch.zeros(2, 1), num_steps=4, solver="heun",
+    )
+
+    assert seen, "the field was never called"
+    # Tolerance is float32 epsilon, not slack: the clamp happens in float64 and
+    # is then cast, so 0.999 comes back as 0.99900001.
+    assert max(seen) <= TAU_QUERY_LIMIT + 1e-6, (
+        f"the field was queried at tau={max(seen)}, past the {TAU_QUERY_LIMIT} guard"
+    )
+    assert max(seen) < 1.0, "the field was queried at tau=1.0"
+    # The guard must only clip the very top; every other node is untouched.
+    assert any(abs(t - 0.75) < 1e-9 for t in seen), "interior tau values were disturbed"

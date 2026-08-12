@@ -14,6 +14,8 @@ from typing import List
 
 import torch
 
+from protein_flow.hf_cache import load_cached
+
 DEFAULT_MODEL_NAME = "facebook/esm2_t6_8M_UR50D"  # hidden_size=320, matches DataConfig.plm_dim default
 
 
@@ -43,8 +45,8 @@ def compute_esm_embeddings(
     """
     from transformers import AutoModel, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device)
+    tokenizer = load_cached(AutoTokenizer, model_name)
+    model = load_cached(AutoModel, model_name).to(device)
     model.eval()
 
     embeddings: List[torch.Tensor] = []

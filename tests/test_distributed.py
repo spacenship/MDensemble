@@ -186,3 +186,125 @@ def test_two_process_ddp_synchronises_gradients(tmp_path):
     assert max_diff == 0.0, f"parameters diverged across ranks (max diff {max_diff})"
     # 16 samples / batch 2 / 2 ranks = 4 batches each.
     assert "BATCHES_PER_RANK 4" in output, output
+
+
+# --------------------------------------------------------------------------
+# Validation sharding / budget regressions
+# --------------------------------------------------------------------------
+def test_val_max_batches_caps_the_evaluation():
+    from protein_flow.train import build_dataloaders, evaluate_detailed
+    from protein_flow.models.dual_graph_flow import DualGraphFlowModel
+
+    config = Config()
+    config.data.plm_dim = 8
+    config.data.train_size = 4
+    config.data.val_size = 24
+    config.data.batch_size = 2
+    config.data.min_length = 6
+    config.data.max_length = 6
+    for module in (
+        config.model.sequence_encoder, config.model.geometric_encoder,
+        config.model.fusion, config.model.decoder,
+    ):
+        module.hidden_dim = 8
+    config.model.fusion.condition_dim = 4
+    config.model.sequence_encoder.num_layers = 2
+    config.model.geometric_encoder.num_layers = 2
+    config.model.graph.knn_k = 3
+    config.model.graph.num_rbf = 4
+    config.train.val_tau_values = [0.5]
+
+    torch.manual_seed(0)
+    model = DualGraphFlowModel(config).eval()
+    _, val_loader = build_dataloaders(config)
+    assert len(val_loader) == 12
+
+    config.train.val_max_batches = 3
+    capped = evaluate_detailed(model, val_loader, config, torch.device("cpu"))
+    config.train.val_max_batches = None
+    full = evaluate_detailed(model, val_loader, config, torch.device("cpu"))
+
+    # Different amounts of data -> different means; the cap must actually bite.
+    assert capped["fm"] != full["fm"]
+
+
+def test_endpoint_batches_are_drawn_from_the_visited_range():
+    """Regression: the endpoint batch indices used to be sampled from the
+    whole loader while the loop stopped early at val_max_batches, so with a
+    small cap the endpoint metrics silently disappeared from the report."""
+    from protein_flow.train import build_dataloaders, evaluate_detailed
+    from protein_flow.models.dual_graph_flow import DualGraphFlowModel
+
+    config = Config()
+    config.data.plm_dim = 8
+    config.data.train_size = 4
+    config.data.val_size = 60
+    config.data.batch_size = 2
+    config.data.min_length = 6
+    config.data.max_length = 6
+    for module in (
+        config.model.sequence_encoder, config.model.geometric_encoder,
+        config.model.fusion, config.model.decoder,
+    ):
+        module.hidden_dim = 8
+    config.model.fusion.condition_dim = 4
+    config.model.sequence_encoder.num_layers = 2
+    config.model.geometric_encoder.num_layers = 2
+    config.model.graph.knn_k = 3
+    config.model.graph.num_rbf = 4
+    config.train.val_tau_values = [0.5]
+    config.train.val_max_batches = 2          # only 2 of 30 batches are visited
+    config.train.val_endpoint_enabled = True
+    config.train.val_endpoint_num_steps = 1
+    config.train.val_endpoint_max_batches = 2
+    config.train.val_endpoint_solver = "euler"
+
+    torch.manual_seed(0)
+    model = DualGraphFlowModel(config).eval()
+    _, val_loader = build_dataloaders(config)
+    assert len(val_loader) == 30
+
+    metrics = evaluate_detailed(model, val_loader, config, torch.device("cpu"))
+    assert "endpoint_generated_rmsd" in metrics, "endpoint metrics vanished under a small val cap"
+    assert torch.isfinite(torch.tensor(metrics["endpoint_generated_rmsd"]))
+
+
+def test_esm_parameter_group_survives_ddp_wrapping():
+    """The PLM must keep its own (much smaller) learning rate under DDP.
+
+    Regression test: DDP prefixes parameter names with ``module.``, so a
+    prefix match against the *wrapped* model matches nothing, silently
+    collapsing the two groups into one and fine-tuning ESM at the flow
+    network's rate. That went unnoticed for entire multi-GPU runs.
+    """
+    import torch.nn as nn
+
+    from protein_flow.train import _build_parameter_groups
+
+    class Wrapper(nn.Module):
+        """Mimics DDP's contract: the real module hangs off ``.module``."""
+
+        def __init__(self, module: nn.Module):
+            super().__init__()
+            self.module = module
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.esm_encoder = nn.Linear(4, 4)
+            self.decoder = nn.Linear(4, 4)
+
+    config = Config()
+    config.model.esm.enabled = True
+    config.model.esm.learning_rate = 1e-5
+    config.train.optim.lr = 3e-4
+
+    model = FakeModel()
+    expected = [3e-4, 1e-5]
+    assert [group["lr"] for group in _build_parameter_groups(model, config)] == expected
+    assert [group["lr"] for group in _build_parameter_groups(Wrapper(model), config)] == expected
+
+    # And the ESM group must hold the ESM tensors, not merely exist.
+    groups = _build_parameter_groups(Wrapper(model), config)
+    esm_ids = {id(p) for p in model.esm_encoder.parameters()}
+    assert {id(p) for p in groups[1]["params"]} == esm_ids

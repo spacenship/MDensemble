@@ -128,6 +128,7 @@ train:
   overfit_one_batch: false
   # Fixed flow-time grid removes random-tau checkpoint-selection noise.
   val_tau_values: [0.2, 0.5, 0.8]
+  val_max_batches: 50
   # Rollout quality is measured on a fixed seeded subset, not added to the loss.
   val_endpoint_enabled: true
   val_endpoint_num_steps: 10

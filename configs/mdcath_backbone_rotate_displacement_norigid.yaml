@@ -1,0 +1,83 @@
+# Displacement flow, with the rigid-body subspace projected out.
+#
+# Inherits the whole displacement setup and changes exactly one thing:
+# flow.remove_rigid_motion. Everything else -- data, network, schedule,
+# noise_scale, lambda_direction -- is identical to the run this follows, so
+# the comparison isolates the projection.
+#
+# Why: the first full displacement run finished cleanly (27/27 chunks, 67,040
+# steps, exit 0, fm_improvement 85.9%) and reached moved 0.74 against MD.
+# Decomposing that number (scripts/diagnostics/path_amplitude.py):
+#
+#     0.840  the flow's raw amplitude against the analytic marginal
+#   x 0.911  the fraction surviving Kabsch alignment
+#   = 0.765  measured
+#
+# The second factor is 17.0% of the output energy sitting in global rotation.
+# The target cannot contain it -- delta is defined by Kabsch-aligning x1 onto
+# x0, and re-aligning delta removes 0.0% of its energy against 74.3% before
+# alignment -- so that amplitude is spent on a mode that scores nothing.
+#
+# What this is NOT: the base noise is not the source. An isotropic field on N
+# particles carries only 3/(3N-3) of its energy in the rotation modes, measured
+# 0.4% at N~270 against the model's 17.0%. The rotation is manufactured by the
+# network, so projecting the noise alone would fix nothing. The velocity is
+# where it has to be removed; the noise is projected too only because with the
+# velocity constrained, nothing else could ever remove the noise's own share.
+# See scripts/diagnostics/rigid_share.py and README section 19.
+#
+# Expected effect, stated in advance so it can be falsified: moved should rise
+# toward 0.84 with contact Jaccard unchanged, because the removed component is
+# orthogonal to the target and its removal is a strict reduction of the
+# flow-matching error. It does NOT address the other factor -- the 0.840 -- which
+# a velocity-gain sweep showed is a *direction* deficit, not a scale one
+# (gain 1.2 buys moved 1.11 but drops contact Jaccard 0.481 -> 0.442, i.e. below
+# MD's own 0.482). That one needs the model to become more collective, not a
+# projection.
+#
+# Usage:
+#   scripts/run_training_tmux.sh \
+#     -c configs/mdcath_backbone_rotate_displacement_norigid.yaml -g 0,1 -n 2 --restarts 20
+
+base_config: mdcath_backbone_rotate_displacement.yaml
+
+flow:
+  # Project both the base noise and the predicted velocity onto zero linear
+  # and angular momentum about the source structure's centroid. One flag
+  # drives both ends: projecting the velocity while leaving the noise alone
+  # would strand the noise's rotational component in the state permanently,
+  # since with the velocity constrained nothing can remove it afterwards.
+  remove_rigid_motion: true
+
+data:
+  rotation:
+    # Overridden here rather than in the base so the two runs this one is
+    # compared against keep the schedule they actually ran with.
+    #
+    # The chunk barrier is a race between training the resident chunk and
+    # prefetching the next one, and at 32 it was very nearly a tie: 32 x 78
+    # batches x 1.10 s = 46 min of training against ~43 min to fetch a rank's
+    # ~70 GB slice. Measured, the download side is a hard ceiling -- the host
+    # tops out near 45 MB/s no matter how many connections are opened (1 Gb/s
+    # NIC, so the limit is upstream), and two ranks split it into the ~27 MB/s
+    # that the rotation logs have been reporting all along. 40 buys ~14 min of
+    # slack for ~5 h more per cycle. Note this widens the schedule difference
+    # against the run above; it is a throughput knob, not a modelling one, but
+    # it does mean the two runs no longer differ in exactly one field.
+    passes_per_chunk: 40
+
+train:
+  # Separate directory: this is a new run, not a resume. The architecture is
+  # unchanged and the weights would load, but resuming would mix a model
+  # trained to produce rotation with an objective that forbids it.
+  ckpt_dir: checkpoints_mdcath_displacement_norigid
+  # fp16 tops out at 65504 and the forward pass reaches it once the weights
+  # have grown: measured at step 34,000 (max|param| 26.7), 23 of 60 training
+  # batches returned a non-finite loss under fp16 and 0 of 60 under bf16, with
+  # identical finite losses where both survived. The projection was not
+  # involved -- the same 23/60 appears with it disabled.
+  #
+  # It presented as a data problem for hours because validation runs outside
+  # autocast, so it stayed finite (and hit a new best, 7.2769) while nearly
+  # every training step was being skipped.
+  amp_dtype: bfloat16

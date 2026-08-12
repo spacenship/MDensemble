@@ -332,13 +332,13 @@ def test_real_topology_matches_pdb_path_and_is_physical():
         ca_indices, residue_names = parse_ca_indices_and_resnames(group["pdbProteinAtoms"][()])
 
     # CA atoms found via PSF atom names must match the independent PDB-text path.
-    heavy_coords = all_atom_coords[topology.heavy_indices]
+    heavy_coords = all_atom_coords[topology.particle_indices]
     assert np.allclose(heavy_coords[topology.ca_atom_index], all_atom_coords[ca_indices])
     assert topology.residue_names == residue_names
 
     # Hydrogens really are excluded.
-    assert topology.num_heavy < int(np.asarray(all_atom_coords).shape[0])
-    assert topology.num_heavy / topology.num_residues == pytest.approx(7.9, abs=1.0)
+    assert topology.num_particles < int(np.asarray(all_atom_coords).shape[0])
+    assert topology.num_particles / topology.num_residues == pytest.approx(7.9, abs=1.0)
 
     # Real covalent geometry. The upper bound has to accommodate genuine
     # disulfide bridges: this shard contains 8 CYS-CYS S-S bonds reaching

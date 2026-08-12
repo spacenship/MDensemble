@@ -21,9 +21,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from protein_flow.config import Config
+from protein_flow.config import Config, is_atom_level
 from protein_flow.data.topology import NUM_ELEMENT_TYPES
-from protein_flow.flow.solver import integrate_ode
+from protein_flow.flow.solver import integrate_displacement_ode, integrate_ode
 from protein_flow.models.esm_encoder import EsmSequenceEncoder
 from protein_flow.models.fusion import GatedFusion
 from protein_flow.models.geometric_encoder import GeometricEncoder
@@ -50,6 +50,17 @@ class DualGraphFlowModel(nn.Module):
         )
 
         self.representation = data_cfg.representation
+        # The displacement path flows noise -> (x1 - x0) with x0 handed to the
+        # model as conditioning, so the geometric side gains an extra 3-vector
+        # input that both the encoder and the decoder have to be sized for.
+        self.flow_path_type = config.flow.path_type
+        self.uses_flow_state = config.flow.path_type == "displacement"
+        self.noise_scale = config.flow.noise_scale
+        self.noise_smoothing_rounds = config.flow.noise_smoothing_rounds
+        self.knn_k = graph_cfg.knn_k
+        # Must reach both the decoder and the sampler's noise draw: projecting
+        # one without the other leaves a rigid component nothing can remove.
+        self.remove_rigid_motion = config.flow.remove_rigid_motion
 
         # Optional in-graph PLM. When enabled the model produces its own
         # residue embeddings from token ids instead of consuming precomputed
@@ -76,7 +87,7 @@ class DualGraphFlowModel(nn.Module):
         # never receives gradient.
         self.element_embedding = (
             nn.Embedding(NUM_ELEMENT_TYPES, model_cfg.geometric_encoder.hidden_dim, padding_idx=0)
-            if data_cfg.representation == "heavy_atom"
+            if is_atom_level(data_cfg.representation)
             else None
         )
         self.geometric_encoder = GeometricEncoder(
@@ -91,6 +102,8 @@ class DualGraphFlowModel(nn.Module):
             rbf_min_dist=graph_cfg.rbf_min_dist,
             rbf_max_dist=graph_cfg.rbf_max_dist,
             use_chirality_features=model_cfg.geometric_encoder.use_chirality_features,
+            gradient_checkpointing=model_cfg.geometric_encoder.gradient_checkpointing,
+            use_flow_state=self.uses_flow_state,
         )
 
         self.fusion = GatedFusion(
@@ -98,6 +111,11 @@ class DualGraphFlowModel(nn.Module):
             geo_hidden_dim=model_cfg.geometric_encoder.hidden_dim,
             fusion_hidden_dim=model_cfg.fusion.hidden_dim,
             condition_dim=model_cfg.fusion.condition_dim,
+            temperature_min=model_cfg.fusion.temperature_min,
+            temperature_max=model_cfg.fusion.temperature_max,
+            delta_t_max=model_cfg.fusion.delta_t_max,
+            embedding_scale=model_cfg.fusion.embedding_scale,
+            film_conditioning=model_cfg.fusion.film_conditioning,
         )
 
         self.decoder = VectorFieldDecoder(
@@ -107,6 +125,8 @@ class DualGraphFlowModel(nn.Module):
             rbf_min_dist=graph_cfg.rbf_min_dist,
             rbf_max_dist=graph_cfg.rbf_max_dist,
             remove_com_velocity=model_cfg.decoder.remove_com_velocity,
+            use_flow_state=self.uses_flow_state,
+            remove_rigid_motion=config.flow.remove_rigid_motion,
         )
 
     def forward(
@@ -124,12 +144,16 @@ class DualGraphFlowModel(nn.Module):
         ca_atom_index: Optional[Tensor] = None,
         esm_input_ids: Optional[Tensor] = None,
         esm_attention_mask: Optional[Tensor] = None,
+        flow_state: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
-            x_tau: [B, N, 3] current flow-time particle coordinates. N == L
-                in the C-alpha representation; N is the heavy-atom count in
-                the all-atom representation.
+            x_tau: [B, N, 3] the particle coordinates the geometric graph is
+                built from. In the coordinate-space flow this is the current
+                flow-time position; in the displacement flow it is the source
+                structure x0, fixed for the whole trajectory. N == L in the
+                C-alpha representation; N is the heavy-atom count in the
+                all-atom representation.
             tau: [B] flow time in [0, 1] (NOT physical MD time).
             sequence_embedding: [B, L, D_plm] precomputed PLM residue embeddings.
             residue_types: [B, L] long amino-acid type indices.
@@ -144,6 +168,12 @@ class DualGraphFlowModel(nn.Module):
                 is enabled, in which case ``sequence_embedding`` is ignored
                 and the embedding is computed (and fine-tuned) here instead.
             esm_attention_mask: [B, T] 1 for real tokens.
+            flow_state: [B, N, 3] point on the displacement path, in
+                displacement space. Required iff the model was built with
+                ``flow.path_type: displacement``. It reaches the encoder only
+                as rotation-invariant projections and the decoder as an
+                extra equivariant basis vector, so the output stays
+                SE(3)-equivariant in ``x_tau`` and ``flow_state`` jointly.
 
         Passing the four optional atom tensors switches the geometric side
         to all-atom; omitting them keeps the C-alpha behaviour.
@@ -173,8 +203,8 @@ class DualGraphFlowModel(nn.Module):
             h_seq_particles = torch.gather(h_seq, 1, gather_index)
             if self.element_embedding is None:
                 raise ValueError(
-                    "Model was built with representation='ca' but all-atom tensors were passed; "
-                    "set data.representation='heavy_atom' in the config."
+                    "Model was built with representation='ca' but atom-level tensors were passed; "
+                    "set data.representation='backbone' or 'heavy_atom' in the config."
                 )
             atom_residue_types = torch.gather(residue_types, 1, atom_residue_index)
             h_geo_init = self.geometric_aa_embedding(atom_residue_types) + self.element_embedding(atom_element)
@@ -188,12 +218,16 @@ class DualGraphFlowModel(nn.Module):
             atom_residue_index=atom_residue_index,
             ca_atom_index=ca_atom_index,
             residue_level_mask=residue_mask if is_all_atom else None,
+            flow_state=flow_state,
         )
 
         h_fused = self.fusion(
             h_seq_particles, h_geo, tau, temperature, physical_delta_t, particle_mask
         )
-        return self.decoder(h_fused, graph, particle_mask)
+        # x_tau is what the graph was built from -- the source structure in
+        # displacement mode, the interpolant in coordinate mode -- and so is
+        # the frame the rigid-body projection is taken about.
+        return self.decoder(h_fused, graph, particle_mask, flow_state=flow_state, coords=x_tau)
 
     def sample(
         self,
@@ -206,18 +240,43 @@ class DualGraphFlowModel(nn.Module):
         num_steps: int = 50,
         solver: str = "heun",
         return_trajectory: bool = False,
+        generator: Optional[torch.Generator] = None,
         **atom_inputs: Optional[Tensor],
     ) -> Tuple[Tensor, Tensor]:
-        """Integrate dx/dtau = v_theta(x, tau, ...) from tau=0 (source_coords) to tau=1.
+        """Integrate the flow ODE and return the generated structure.
 
-        Runs under ``torch.no_grad()``. Returns ``(generated_coords, trajectory)``
-        where ``trajectory`` has shape [num_steps + 1, B, N, 3] when
-        ``return_trajectory`` is True. Any all-atom tensors
+        Which ODE depends on ``flow.path_type``:
+
+        ``linear``/``gaussian_bridge`` integrate dx/dtau = v(x, tau, ...) in
+        coordinate space starting at ``source_coords``. Deterministic: the
+        same inputs always give the same output.
+
+        ``displacement`` draws eps ~ N(0, noise_scale^2 I), integrates in
+        displacement space, and returns ``source_coords + state``. Stochastic
+        by construction -- pass ``generator`` to make a draw reproducible, or
+        call repeatedly to build an ensemble.
+
+        Runs under ``torch.no_grad()``. Returns ``(generated_coords,
+        trajectory)`` where ``trajectory`` has shape [num_steps + 1, B, N, 3]
+        when ``return_trajectory`` is True; its entries are always
+        coordinates, including in displacement mode. Any all-atom tensors
         (``atom_mask``/``atom_residue_index``/``atom_element``/``ca_atom_index``)
         may be passed as keyword arguments and are forwarded to every
         velocity evaluation along the trajectory.
         """
-        return integrate_ode(
+        integrate = integrate_displacement_ode if self.uses_flow_state else integrate_ode
+        extra = (
+            {
+                "noise_scale": self.noise_scale,
+                "smoothing_rounds": self.noise_smoothing_rounds,
+                "knn_k": self.knn_k,
+                "remove_rigid_motion": self.remove_rigid_motion,
+                "generator": generator,
+            }
+            if self.uses_flow_state
+            else {}
+        )
+        return integrate(
             self,
             source_coords,
             sequence_embedding,
@@ -228,5 +287,6 @@ class DualGraphFlowModel(nn.Module):
             num_steps=num_steps,
             solver=solver,
             return_trajectory=return_trajectory,
+            **extra,
             **atom_inputs,
         )

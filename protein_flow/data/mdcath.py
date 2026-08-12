@@ -39,10 +39,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from protein_flow.config import DataConfig
+from protein_flow.config import DataConfig, is_atom_level
 from protein_flow.data.dataset import ProteinTrajectoryDataset
 from protein_flow.data.residue_vocab import resname_to_index, resname_to_one_letter
-from protein_flow.data.topology import AtomTopology, parse_heavy_atom_topology
+from protein_flow.hf_cache import load_cached
+from protein_flow.data.topology import (
+    AtomTopology,
+    parse_backbone_topology,
+    parse_heavy_atom_topology,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +82,32 @@ def parse_ca_indices_and_resnames(pdb_text_bytes: bytes) -> Tuple[np.ndarray, Li
     return np.asarray(ca_indices, dtype=np.int64), residue_names
 
 
+def parse_residue_labels(pdb_text_bytes: bytes) -> np.ndarray:
+    """Per-atom residue identity, insertion codes included.
+
+    mdCATH's ``resid`` array stores only the residue *number*, so residues
+    that a PDB distinguishes by insertion code collapse together in it:
+    1hpgA02 has five consecutive residues numbered 120, 120A, 120B, 120C and
+    120D, all of which appear as ``resid == 120``. Grouping backbone atoms by
+    that array would build one 20-atom "residue" and break the 4-atoms-per-
+    residue invariant, which is why the topology is keyed off these labels.
+
+    The embedded PDB is one line per atom in the same order as the per-atom
+    arrays (verified: line count equals ``numProteinAtoms`` and the resnames
+    match element-for-element), so the returned array aligns with them.
+
+    Returns:
+        [num_atoms] array of ``"<chain>:<resSeq><iCode>"`` strings.
+    """
+    text = pdb_text_bytes.decode("utf-8", errors="replace")
+    labels: List[str] = []
+    for line in text.splitlines():
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        labels.append(f"{line[21]}:{line[22:26].strip()}{line[26].strip()}")
+    return np.asarray(labels, dtype=object)
+
+
 class MdCathDataset(ProteinTrajectoryDataset):
     """Yields real (source, target) C-alpha frame pairs from mdCATH shards.
 
@@ -103,11 +134,13 @@ class MdCathDataset(ProteinTrajectoryDataset):
         resample_each_epoch: bool = False,
         representation: str = "ca",
         esm_tokenizer_name: Optional[str] = None,
+        max_residues: Optional[int] = None,
     ):
         if not _HAS_H5PY:
             raise ImportError("MdCathDataset requires h5py: pip install h5py")
-        if representation not in ("ca", "heavy_atom"):
-            raise ValueError(f"representation must be 'ca' or 'heavy_atom', got {representation!r}")
+        self.is_atom_level = is_atom_level(representation)  # also validates the value
+        if max_residues is not None and max_residues < 1:
+            raise ValueError("max_residues must be >= 1 when set")
         if frame_gap < 1:
             raise ValueError("frame_gap must be >= 1")
         if sampling_max_frame_gap is not None and sampling_max_frame_gap < frame_gap:
@@ -117,6 +150,7 @@ class MdCathDataset(ProteinTrajectoryDataset):
 
         self.data_config = data_config
         self.representation = representation
+        self.max_residues = max_residues
         self.frame_gap = frame_gap
         self.sampling_max_frame_gap = sampling_max_frame_gap or frame_gap
         self.ps_per_frame = ps_per_frame
@@ -142,6 +176,8 @@ class MdCathDataset(ProteinTrajectoryDataset):
         self._domain_topology: Dict[str, "AtomTopology"] = {}
         self._domain_residue_names: Dict[str, List[str]] = {}
         self.trajectory_index: List[Dict[str, Any]] = []
+        self.skipped_too_long: List[Tuple[str, int]] = []
+        self._skipped_domains: set[str] = set()
 
         for path in h5_files:
             try:
@@ -149,6 +185,12 @@ class MdCathDataset(ProteinTrajectoryDataset):
             except Exception:  # noqa: BLE001 - one malformed shard shouldn't kill the whole dataset
                 logger.exception("Skipping unreadable mdCATH shard: %s", path)
 
+        if self.skipped_too_long:
+            logger.info(
+                "Skipped %d domain(s) longer than max_residues=%d (longest: %s)",
+                len(self.skipped_too_long), self.max_residues,
+                max(self.skipped_too_long, key=lambda item: item[1]),
+            )
         if not self.trajectory_index:
             raise RuntimeError(f"No usable (domain, temperature, replica) trajectories found under {data_dir}")
 
@@ -157,20 +199,40 @@ class MdCathDataset(ProteinTrajectoryDataset):
             domain = next(iter(f.keys()))
             group = f[domain]
 
+            if domain in self._skipped_domains:
+                return
             if domain not in self._domain_meta:
                 pdb_bytes = group["pdbProteinAtoms"][()]
                 ca_indices, residue_names = parse_ca_indices_and_resnames(pdb_bytes)
+                # Length cap first: the whole point is to never build (or
+                # later batch) a domain that would blow up memory.
+                if self.max_residues is not None and len(ca_indices) > self.max_residues:
+                    self.skipped_too_long.append((domain, len(ca_indices)))
+                    self._skipped_domains.add(domain)
+                    return
                 residue_types = torch.tensor([resname_to_index(r) for r in residue_names], dtype=torch.long)
                 self._domain_meta[domain] = (ca_indices, residue_types, len(ca_indices))
                 self._domain_residue_names[domain] = residue_names
 
-                if self.representation == "heavy_atom":
-                    topology = parse_heavy_atom_topology(
+                if self.is_atom_level:
+                    parse_topology = (
+                        parse_backbone_topology
+                        if self.representation == "backbone"
+                        else parse_heavy_atom_topology
+                    )
+                    num_protein_atoms = int(group.attrs["numProteinAtoms"])
+                    residue_labels = parse_residue_labels(pdb_bytes)
+                    if residue_labels.shape[0] < num_protein_atoms:
+                        raise ValueError(
+                            f"{domain}: embedded PDB has {residue_labels.shape[0]} atom records "
+                            f"but numProteinAtoms is {num_protein_atoms}"
+                        )
+                    topology = parse_topology(
                         group["psf"][()],
                         np.asarray([e.decode() for e in group["element"][:]]),
-                        group["resid"][:],
+                        residue_labels[:num_protein_atoms],
                         np.asarray([r.decode() for r in group["resname"][:]]),
-                        int(group.attrs["numProteinAtoms"]),
+                        num_protein_atoms,
                     )
                     if topology.num_residues != len(ca_indices):
                         raise ValueError(
@@ -237,7 +299,9 @@ class MdCathDataset(ProteinTrajectoryDataset):
         if self._esm_tokenizer is None:
             from transformers import AutoTokenizer
 
-            self._esm_tokenizer = AutoTokenizer.from_pretrained(self.esm_tokenizer_name)
+            # Cache-first: this runs once per dataloader worker, and a HEAD
+            # revalidation that stalls here stalls the whole training step.
+            self._esm_tokenizer = load_cached(AutoTokenizer, self.esm_tokenizer_name)
         sequence = "".join(resname_to_one_letter(r) for r in self._domain_residue_names[domain])
         encoded = self._esm_tokenizer(sequence, return_tensors="pt")
         token_ids = encoded["input_ids"][0]
@@ -276,10 +340,11 @@ class MdCathDataset(ProteinTrajectoryDataset):
             target_full = coords_dataset[target_frame]
 
         # In "ca" mode the flowing particles are the C-alpha atoms; in
-        # "heavy_atom" mode they are every non-hydrogen protein atom.
-        if self.representation == "heavy_atom":
+        # "backbone" mode the N/CA/C/O of every residue; in "heavy_atom"
+        # mode every non-hydrogen protein atom.
+        if self.is_atom_level:
             topology = self._domain_topology[entry["domain"]]
-            particle_indices = topology.heavy_indices
+            particle_indices = topology.particle_indices
         else:
             particle_indices = ca_indices
 
@@ -302,7 +367,7 @@ class MdCathDataset(ProteinTrajectoryDataset):
         }
         if self.esm_tokenizer_name is not None:
             sample["esm_input_ids"] = self._domain_token_ids(entry["domain"])
-        if self.representation == "heavy_atom":
+        if self.is_atom_level:
             topology = self._domain_topology[entry["domain"]]
             sample.update(
                 atom_residue_index=torch.from_numpy(topology.atom_residue_index),

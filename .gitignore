@@ -11,3 +11,6 @@ checkpoints_mdcath_all_atom/
 checkpoints_mdcath_esm/
 checkpoints_mdcath_full/
 checkpoints_mdcath_large/
+checkpoints_mdcath_backbone/
+checkpoints_mdcath_displacement/
+checkpoints_mdcath_displacement_norigid/

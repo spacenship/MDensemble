@@ -7,3 +7,5 @@ pytest
 # torch_scatter        # used for scatter-based aggregation if available; a pure-PyTorch fallback is always used otherwise
 # transformers          # only needed for the optional ESM embedding adapter
 # h5py                 # only needed for MdCathDataset (data.source: mdcath)
+# huggingface_hub       # only needed for shard rotation (data.rotation.enabled); see README section 17
+# hf_transfer           # optional download accelerator for rotation (HF_HUB_ENABLE_HF_TRANSFER=1)

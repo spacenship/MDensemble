@@ -38,6 +38,14 @@ LOG=""
 FORCE=0
 NPROC="1"
 MASTER_PORT=
+# Times to relaunch after a non-zero exit. Only useful together with
+# train.resume: auto -- each attempt picks up the last checkpoint. 0 keeps
+# the historical single-shot behaviour.
+RESTARTS=0
+# An attempt that dies faster than this is a real failure (bad config, OOM on
+# the first batch, missing data), not a hang worth retrying, so retrying it
+# would just spin. Anything longer had time to reach steady training.
+MIN_RUN_SECONDS=300
 
 usage() {
   # Print the leading comment block only (stop at the first non-comment line),
@@ -56,6 +64,12 @@ Options:
       --master-port P  torchrun rendezvous port (default: a free port).
   -l, --log PATH       Log file path (default: $RUN_LOG_DIR/<session>.log).
       --force          Allow reusing an existing log / checkpoint directory.
+      --restarts N     Relaunch up to N times after a non-zero exit (default 0).
+                       Needs train.resume: auto -- each attempt continues from
+                       the last checkpoint, which is what makes an occasional
+                       hang survivable on a multi-day run. An attempt that
+                       dies within 300 s is treated as a startup error and
+                       stops the loop rather than spinning on it.
   -h, --help           Show this message.
 
 Environment:
@@ -71,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     -g|--gpu)     GPU="${2:-}"; shift 2 ;;
     -n|--nproc)   NPROC="${2:-}"; shift 2 ;;
     --master-port) MASTER_PORT="${2:-}"; shift 2 ;;
+    --restarts)   RESTARTS="${2:-}"; shift 2 ;;
     -l|--log)     LOG="${2:-}"; shift 2 ;;
     --force)      FORCE=1; shift ;;
     -h|--help)    usage; exit 0 ;;
@@ -123,7 +138,7 @@ fi
 # depending on how the shell was started: a fresh login shell here picks the
 # base conda env, which has torch but *not* h5py, so an mdCATH run would die
 # minutes in. Better to fail immediately with an actionable message.
-PREFLIGHT="$("$RUN_PYTHON" - "$REPO_ROOT/$CONFIG" <<'PY' 2>&1
+PREFLIGHT="$("$RUN_PYTHON" - "$REPO_ROOT/$CONFIG" "$REPO_ROOT" <<'PY' 2>&1
 import importlib
 import sys
 
@@ -133,8 +148,19 @@ except ImportError:
     print("ERROR|this interpreter has no PyYAML")
     sys.exit(0)
 
-with open(sys.argv[1]) as fh:
-    config = yaml.safe_load(fh) or {}
+# Resolve base_config with the project's own loader (it needs nothing beyond
+# PyYAML). Reading the raw file instead would miss anything a config inherits
+# -- e.g. model.esm.enabled living in the base -- and silently skip the
+# dependency check it should have triggered.
+sys.path.insert(0, sys.argv[2])
+try:
+    from protein_flow.config import _load_raw_config
+    from pathlib import Path
+
+    config = _load_raw_config(Path(sys.argv[1]))
+except Exception:
+    with open(sys.argv[1]) as fh:
+        config = yaml.safe_load(fh) or {}
 
 data = config.get("data") or {}
 model = config.get("model") or {}
@@ -144,6 +170,8 @@ if data.get("source") == "mdcath":
     required["h5py"] = "h5py (needed for data.source: mdcath)"
 if ((model.get("esm") or {}).get("enabled")):
     required["transformers"] = "transformers (needed for model.esm.enabled)"
+if ((data.get("rotation") or {}).get("enabled")):
+    required["huggingface_hub"] = "huggingface_hub (needed for data.rotation.enabled)"
 
 missing = []
 for module, label in required.items():
@@ -186,15 +214,41 @@ if [[ "$NPROC" -gt 1 ]]; then
   if [[ -z "$MASTER_PORT" ]]; then
     MASTER_PORT="$("$RUN_PYTHON" -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')"
   fi
-  LAUNCHER="$(printf '%q' "$(dirname "$RUN_PYTHON")/torchrun") --nproc_per_node=$(printf '%q' "$NPROC") --master_port=$(printf '%q' "$MASTER_PORT")"
+  # Re-picked per attempt when restarting: a rank that was aborted mid-run can
+  # leave the previous port unusable for a while, and a bind failure would
+  # otherwise look like an instant startup error and stop the restart loop.
+  PORT_EXPR="\$($(printf '%q' "$RUN_PYTHON") -c 'import socket; s=socket.socket(); s.bind((\"\",0)); print(s.getsockname()[1]); s.close()')"
+  [[ -n "$MASTER_PORT" ]] && PORT_EXPR="$(printf '%q' "$MASTER_PORT")"
+  LAUNCHER="$(printf '%q' "$(dirname "$RUN_PYTHON")/torchrun") --nproc_per_node=$(printf '%q' "$NPROC") --master_port=$PORT_EXPR"
 else
   LAUNCHER="$(printf '%q' "$RUN_PYTHON") -u"
 fi
 
-COMMAND="cd $(printf '%q' "$REPO_ROOT") && \
-CUDA_VISIBLE_DEVICES=$(printf '%q' "$GPU") $LAUNCHER train.py \
---config $(printf '%q' "$CONFIG") 2>&1 | tee $(printf '%q' "$LOG"); \
+RUN_ONCE="CUDA_VISIBLE_DEVICES=$(printf '%q' "$GPU") $LAUNCHER train.py \
+--config $(printf '%q' "$CONFIG") 2>&1 | tee -a $(printf '%q' "$LOG")"
+
+if [[ "$RESTARTS" -gt 0 ]]; then
+  # Relaunch after a crash or a watchdog abort. Each attempt resumes from the
+  # last checkpoint, so a run that hangs every few tens of thousands of steps
+  # still finishes instead of stopping overnight at the first failure.
+  COMMAND="cd $(printf '%q' "$REPO_ROOT") && \
+for attempt in \$(seq 0 $(printf '%q' "$RESTARTS")); do \
+  started=\$SECONDS; \
+  $RUN_ONCE; \
+  status=\${PIPESTATUS[0]}; \
+  elapsed=\$(( SECONDS - started )); \
+  echo \"[exit \$status after \${elapsed}s, attempt \$attempt/$(printf '%q' "$RESTARTS")] \$(date -Is)\" | tee -a $(printf '%q' "$LOG"); \
+  if [[ \$status -eq 0 ]]; then break; fi; \
+  if [[ \$elapsed -lt $(printf '%q' "$MIN_RUN_SECONDS") ]]; then \
+    echo \"[giving up] failed after only \${elapsed}s -- looks like a startup error, not a hang\" | tee -a $(printf '%q' "$LOG"); break; fi; \
+  if [[ \$attempt -eq $(printf '%q' "$RESTARTS") ]]; then \
+    echo \"[giving up] exhausted $(printf '%q' "$RESTARTS") restart(s)\" | tee -a $(printf '%q' "$LOG"); break; fi; \
+  echo \"[restarting in 60s]\" | tee -a $(printf '%q' "$LOG"); sleep 60; \
+done; exec bash"
+else
+  COMMAND="cd $(printf '%q' "$REPO_ROOT") && $RUN_ONCE; \
 echo \"[exit \${PIPESTATUS[0]}] finished \$(date -Is)\" | tee -a $(printf '%q' "$LOG"); exec bash"
+fi
 
 tmux new-session -d -s "$SESSION" -c "$REPO_ROOT" "$COMMAND"
 
@@ -202,7 +256,8 @@ cat <<EOF
 started tmux session : $SESSION
   config             : $CONFIG
   GPU                : $GPU
-  processes          : $NPROC$( [[ "$NPROC" -gt 1 ]] && echo "  (DDP via torchrun, port $MASTER_PORT)" )
+  processes          : $NPROC$( [[ "$NPROC" -gt 1 ]] && echo "  (DDP via torchrun, port ${MASTER_PORT:-auto})" )
+  restarts           : $RESTARTS$( [[ "$RESTARTS" -gt 0 ]] && echo "  (resumes from last.pt; gives up if an attempt dies within ${MIN_RUN_SECONDS}s)" )
   log                : $LOG
   checkpoints        : ${CKPT_DIR:-<not set in config>}
 

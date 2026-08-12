@@ -124,3 +124,48 @@ def test_update_coordinates_option_runs_and_stays_invariant():
     h_out, _ = encoder(coords, node_features, mask)
     h_out_r, _ = encoder(coords @ rotation, node_features, mask)
     torch.testing.assert_close(h_out, h_out_r, atol=1e-4, rtol=1e-4)
+
+
+def _checkpointing_pair(update_coordinates=False):
+    """Two encoders that differ only in whether they recompute activations."""
+    torch.manual_seed(7)
+    plain = _make_encoder(update_coordinates=update_coordinates)
+    torch.manual_seed(7)
+    checkpointed = _make_encoder(update_coordinates=update_coordinates)
+    checkpointed.gradient_checkpointing = True
+    checkpointed.load_state_dict(plain.state_dict())
+    return plain.train(), checkpointed.train()
+
+
+def test_gradient_checkpointing_matches_the_plain_forward_and_backward():
+    """Recomputing activations must be a memory trade, not a numerical one."""
+    gen = torch.Generator().manual_seed(7)
+    batch, length, hidden = 2, 9, 16
+    coords = torch.randn(batch, length, 3, generator=gen) * 3.0
+    node_features = torch.randn(batch, length, hidden, generator=gen)
+    mask = torch.ones(batch, length, dtype=torch.bool)
+
+    plain, checkpointed = _checkpointing_pair()
+    outputs = []
+    for encoder in (plain, checkpointed):
+        features = node_features.clone().requires_grad_(True)
+        h_out, _ = encoder(coords, features, mask)
+        h_out.square().sum().backward()
+        outputs.append((h_out.detach(), features.grad.clone()))
+
+    torch.testing.assert_close(outputs[0][0], outputs[1][0], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(outputs[0][1], outputs[1][1], atol=1e-5, rtol=1e-5)
+
+
+def test_gradient_checkpointing_is_inert_in_eval_mode():
+    """Inference has no backward pass to recompute for, so it must not engage."""
+    gen = torch.Generator().manual_seed(8)
+    coords = torch.randn(2, 7, 3, generator=gen) * 3.0
+    node_features = torch.randn(2, 7, 16, generator=gen)
+    mask = torch.ones(2, 7, dtype=torch.bool)
+
+    plain, checkpointed = _checkpointing_pair()
+    with torch.no_grad():
+        expected, _ = plain.eval()(coords, node_features, mask)
+        actual, _ = checkpointed.eval()(coords, node_features, mask)
+    torch.testing.assert_close(expected, actual)

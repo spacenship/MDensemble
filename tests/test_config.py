@@ -54,3 +54,38 @@ def test_mdcath_gap_ablation_configs_are_paired():
         assert config.data.mdcath_frame_gap == gap
         assert config.data.mdcath_sampling_max_frame_gap == 5
         assert config.train.ckpt_dir == f"checkpoints_mdcath_gap{gap}"
+
+
+def test_dist_timeout_must_outlast_download_timeout():
+    """The chunk barrier has to survive a rank sitting in ShardPool.ensure().
+
+    Regression: with the NCCL timeout at 30 min and the downloader's at 180,
+    a rotation where one rank's slice was already resident and the other's
+    was not aborted the run at exactly 1800 s -- the downloader watchdog that
+    would have recovered it could never fire first.
+    """
+    import pytest
+
+    from protein_flow.config import Config, validate_config
+
+    config = Config()
+    config.data.rotation.enabled = True
+    config.data.rotation.download_timeout_minutes = 180
+    config.train.dist_timeout_minutes = 30
+
+    with pytest.raises(ValueError, match="must exceed"):
+        validate_config(config)
+
+    config.train.dist_timeout_minutes = 181
+    validate_config(config)  # strictly greater is enough
+
+
+def test_shipped_rotating_configs_satisfy_the_timeout_ordering():
+    for name in (
+        "mdcath_backbone_rotate.yaml",
+        "mdcath_backbone_rotate_displacement.yaml",
+        "mdcath_backbone_rotate_displacement_norigid.yaml",
+    ):
+        config = load_config(CONFIG_PATH.parent / name)
+        assert config.data.rotation.enabled
+        assert config.train.dist_timeout_minutes > config.data.rotation.download_timeout_minutes

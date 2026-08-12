@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from protein_flow.hf_cache import load_cached
+
 
 class EsmSequenceEncoder(nn.Module):
     """Wraps a HuggingFace ESM2 model to emit residue-aligned embeddings.
@@ -50,7 +52,7 @@ class EsmSequenceEncoder(nn.Module):
                 "In-graph ESM fine-tuning requires `transformers`: pip install transformers"
             ) from error
 
-        self.esm = AutoModel.from_pretrained(model_name, add_pooling_layer=False)
+        self.esm = load_cached(AutoModel, model_name, add_pooling_layer=False)
         self.trainable = trainable
         self.output_dim = int(self.esm.config.hidden_size)
 

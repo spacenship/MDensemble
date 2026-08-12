@@ -12,7 +12,11 @@ Launch multi-GPU runs with ``torchrun``, which sets the ``RANK``,
 """
 from __future__ import annotations
 
+import datetime
+import faulthandler
 import os
+import signal
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -56,11 +60,65 @@ def is_main_process() -> bool:
     return get_rank() == 0
 
 
-def setup_distributed(device_type: str = "cuda") -> torch.device:
+def enable_hang_diagnostics() -> None:
+    """Make a future hang diagnosable, from inside the process.
+
+    Three runs hung and none could be inspected: ``py-spy`` needs ptrace,
+    which ``kernel.yama.ptrace_scope=1`` grants only to a parent, and the
+    machine's ``sudo`` wants a password. So the process is set up to report
+    on itself instead:
+
+    * ``faulthandler`` on SIGUSR1 dumps every thread's Python stack to
+      stderr -- and therefore into the run log -- so ``kill -USR1 <pid>``
+      answers "where is this rank stuck?" with no privileges at all.
+    * The NCCL flight recorder plus dump-on-timeout writes what collective
+      each rank last enqueued and completed, which is what actually
+      identifies the rank that failed to arrive.
+
+    The environment variables are only set when unset, so an operator can
+    still override any of them from the launcher.
+    """
+    faulthandler.enable()
+    if hasattr(signal, "SIGUSR1"):
+        # chain=False on purpose. With chain=True faulthandler hands the signal
+        # on to the previous handler after dumping, and SIGUSR1's default
+        # action is to *terminate* -- so the one tool meant to inspect a live
+        # hang non-destructively killed both ranks the first time it was used.
+        # The dump is the whole point; nothing should follow it.
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+
+    # The flight-recorder buffer variable was renamed in torch 2.9
+    # (TORCH_NCCL_TRACE_BUFFER_SIZE -> TORCH_FR_BUFFER_SIZE). Pick by version
+    # rather than setting both: the old name still works but logs a
+    # deprecation warning from every rank at startup, and setting only the new
+    # one on an older torch would silently leave the recorder off -- which is
+    # the one thing that must not happen, since this exists so that the next
+    # hang is diagnosable.
+    buffer_variable = (
+        "TORCH_FR_BUFFER_SIZE"
+        if tuple(int(part) for part in torch.__version__.split(".")[:2]) >= (2, 9)
+        else "TORCH_NCCL_TRACE_BUFFER_SIZE"
+    )
+    for name, value in (
+        (buffer_variable, "2000"),
+        ("TORCH_NCCL_DUMP_ON_TIMEOUT", "1"),
+        ("TORCH_NCCL_DEBUG_INFO_TEMP_FILE", str(Path.cwd() / "logs" / "nccl_trace")),
+    ):
+        os.environ.setdefault(name, value)
+
+
+def setup_distributed(device_type: str = "cuda", timeout_minutes: int = 30) -> torch.device:
     """Initialise the process group if launched under torchrun.
 
     Returns the device this rank should use. Safe (and a no-op beyond
     picking a device) for ordinary single-process runs.
+
+    ``timeout_minutes`` raises the NCCL watchdog timeout well above its
+    10-minute default. That default is calibrated for steady training steps,
+    but this codebase also runs long collective-free stretches (a full
+    validation pass with ODE rollouts), and a rank waiting at the next
+    collective during one of those would otherwise be killed by the watchdog
+    even though nothing is actually wrong.
     """
     if not is_torchrun_launch():
         return torch.device(device_type)
@@ -77,10 +135,11 @@ def setup_distributed(device_type: str = "cuda") -> torch.device:
     if not dist.is_initialized():
         # Binding the device up front lets collectives (notably barrier) pick
         # the right one instead of guessing from the ambient context.
+        timeout = datetime.timedelta(minutes=timeout_minutes)
         if backend == "nccl":
-            dist.init_process_group(backend=backend, device_id=device)
+            dist.init_process_group(backend=backend, device_id=device, timeout=timeout)
         else:
-            dist.init_process_group(backend=backend)
+            dist.init_process_group(backend=backend, timeout=timeout)
     return device
 
 
@@ -114,6 +173,21 @@ def all_reduce_mean(value: float, device: Optional[torch.device] = None) -> floa
     tensor = torch.tensor([value], dtype=torch.float64, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return float(tensor.item() / get_world_size())
+
+
+def all_gather_object_list(obj) -> list:
+    """Collect one Python object from every rank, on every rank.
+
+    Used to merge validation accumulators. The objects are a few dozen
+    scalars, so the object-based collective is cheap and avoids having to
+    align dictionary keys (e.g. which simulation temperatures a given rank
+    happened to see) into fixed tensor layouts.
+    """
+    if not is_distributed():
+        return [obj]
+    gathered = [None] * get_world_size()
+    dist.all_gather_object(gathered, obj)
+    return gathered
 
 
 def broadcast_object(obj, source_rank: int = 0):

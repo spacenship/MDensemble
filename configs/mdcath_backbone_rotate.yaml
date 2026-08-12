@@ -1,0 +1,191 @@
+# Full-dataset training: the whole of mdCATH (5,398 domains / 3.61 TB) at
+# backbone resolution, by rotating chunks of shards through local disk.
+#
+# Same flow network and in-graph ESM2 fine-tuning as mdcath_full.yaml; what
+# changes is (a) the particles -- N/CA/C/O instead of every heavy atom -- and
+# (b) the data pipeline, which downloads a chunk, trains on it, deletes it,
+# and moves on while prefetching the next one.
+#
+# Usage:
+#   # once: freeze the rotation plan (reuses shards already on disk)
+#   python scripts/build_mdcath_manifest.py \
+#       --output configs/manifests/mdcath_all.json \
+#       --prefer-local /home/mipstu/wjYang/MolecularDynamics/mdCATH_sample100/data
+#
+#   # then, single GPU or DDP:
+#   python train.py --config configs/mdcath_backbone_rotate.yaml
+#   scripts/run_training_tmux.sh -c configs/mdcath_backbone_rotate.yaml -g 0,1 -n 2
+
+base_config: mdcath_full.yaml
+
+data:
+  plm_dim: 640   # must equal the ESM2 checkpoint hidden size (esm2_t30_150M)
+  # Exactly the N, CA, C and O of every residue: 4 particles per residue,
+  # verified exact on real shards (the CHARMM cap atoms CAY/CY/OY and NT/CAT
+  # are excluded by name and share the terminal residues' resid, so nothing
+  # is ragged). Roughly half the particles of heavy_atom, while keeping real
+  # peptide geometry -- bond lengths, backbone angles, carbonyl direction.
+  representation: backbone
+  # Measured on an RTX PRO 6000 (95.0 GiB) at the mdcath_max_residues cap
+  # (512 residues = 2,048 backbone particles), with the endpoint rollout off
+  # and geometric_encoder.gradient_checkpointing on:
+  #     batch 16 -> 22.9 GiB, 0.997 s/step, 0.0623 s/sample
+  #     batch 32 -> 42.8 GiB, 1.879 s/step, 0.0587 s/sample   <- chosen
+  #     batch 48 -> 62.6 GiB, 2.818 s/step, 0.0587 s/sample
+  #     batch 64 -> 82.5 GiB, 3.790 s/step, 0.0592 s/sample   (too tight)
+  # Per-sample throughput is already flat at 32, so 48 and 64 buy nothing but
+  # fewer optimizer steps. 32 leaves ~50 GiB of headroom for DDP's gradient
+  # buckets and allocator fragmentation over a multi-day run.
+  #
+  # For reference, the configuration this replaced (batch 8, endpoint rollout
+  # on, no encoder checkpointing) needed 53.8 GiB for 0.276 s/sample -- more
+  # memory for 4.7x less throughput.
+  batch_size: 32
+  num_workers: 2
+  # The 100-shard sample tops out at 479 residues, but the full dataset has a
+  # long tail; without this a single huge domain can OOM the run hours in.
+  mdcath_max_residues: 512
+
+  source: mdcath
+  # Where the rotation stages shards. This is {rotation.local_dir}/data.
+  mdcath_dir: /home/mipstu/wjYang/MolecularDynamics/mdCATH_rotating/data
+  mdcath_frame_gap: 5
+  mdcath_sampling_max_frame_gap: 5
+  mdcath_ps_per_frame: null
+  # Unused while rotating: the manifest owns the train/val split, so that the
+  # validation set is a fixed global holdout instead of a per-chunk slice.
+  mdcath_val_fraction: 0.15
+  mdcath_train_pairs_per_trajectory: 1
+  mdcath_val_pairs_per_trajectory: 2
+  mdcath_resample_train_each_epoch: true
+  # In-graph ESM produces embeddings inside the model, so no per-domain
+  # embedding cache has to be precomputed for each newly downloaded chunk.
+  mdcath_embedding_cache_dir: null
+
+  rotation:
+    enabled: true
+    repo_id: compsciencelab/mdCATH
+    manifest_path: configs/manifests/mdcath_all.json
+    local_dir: /home/mipstu/wjYang/MolecularDynamics/mdCATH_rotating
+    # 200 domains ~= 134 GB per chunk (measured mean shard 670 MB), so the
+    # resident set is val (~17 GB) + current + prefetched ~= 285 GB. The
+    # byte ceiling matters because shard sizes vary 3.7x: a count-only split
+    # can draw several 2 GB+ shards and overshoot the budget.
+    #
+    # For 500-domain chunks (~335 GB each, 11 chunks) set chunk_size: 500 and
+    # chunk_max_gb: 400 when building the manifest, and prefetch_chunks: 0
+    # here -- prefetching those would need ~690 GB free.
+    # Budget each chunk in whole passes over its data, so no pass is ever cut
+    # short. A step budget cannot do this reliably: one pass is
+    # (trajectories / (batch_size * world_size)) steps -- 625 for 200 domains
+    # at batch 4 on 2 GPUs -- so 2000 steps ran 625+625+625+125, and the
+    # boundary moves whenever batch size, GPU count, or a chunk's usable
+    # trajectory count changes.
+    #
+    # At batch 32 on 2 GPUs one pass is 77-78 steps (~5,000 pairs / 64).
+    #
+    # Sized against the download, which is what actually paces this run. The
+    # 1.88 s/step figure this was first set from came from a synthetic
+    # worst-case domain at the 512-residue cap; real chunks average far
+    # smaller, and the live run measured **0.906 s/step**. At that rate the
+    # original 20 passes finished a chunk in 24 min while prefetching the
+    # next one took 2,389 s (~40 min), so the GPUs idled ~16 min per chunk.
+    #
+    # 32 passes = ~2,496 steps ~= 38 min of stepping, plus ~5 validations at
+    # ~61 s each, so ~43 min per chunk -- just past the 40 min download.
+    # Raise it further if "Waited Ns for chunk k" starts climbing.
+    #
+    # 32 passes over the same 200 domains is not 32x repetition: with
+    # mdcath_resample_train_each_epoch the frame pairs are redrawn every pass,
+    # and each trajectory offers ~435 usable start frames, so 32 passes touch
+    # under 8% of the available pairs.
+    passes_per_chunk: 32
+    # Ignored while passes_per_chunk is set; kept as the wall-clock-oriented
+    # alternative (set passes_per_chunk: null to use it).
+    steps_per_chunk: 2000
+    num_cycles: 1        # one cycle = one pass over all 5,398 domains = 3.61 TB downloaded
+    prefetch_chunks: 1
+    delete_after_use: true
+    keep_resident: []    # e.g. [0] to never delete the first chunk
+    min_free_gb: 150.0
+    download_retries: 3
+    verify_downloads: true
+
+loss:
+  # Dropped from the *training* objective. Over a full 34,500-step run this
+  # term never once helped: endpoint_improvement stayed at -0.06% and
+  # win_rate at 0.00%, while its gradient contribution measured ~5% of the
+  # flow-matching term's (1.07e-02 vs 1.94e-01) and it consumed 82% of the
+  # step (batch 8: 2.21 s/step with the rollout, 0.39 s/step without).
+  # train.val_endpoint_* stays on, so the metric is still reported every
+  # validation -- if it starts improving once conditioning works, that is the
+  # signal to bring the term back.
+  endpoint_enabled: false
+  endpoint_rollout:
+    num_steps: 4
+    gradient_checkpointing: true
+  physics:
+    # Measured on real frames the same way the heavy-atom value was: the
+    # closest non-bonded backbone pair the k-NN clash term sees is 2.278 A.
+    clash_threshold_backbone: 2.2
+    # Evaluate the physics terms at x_tau + (1-tau)*v rather than x_tau + v.
+    # The old constant step charged the *correct* velocity a penalty that grew
+    # with tau -- measured bond loss against the ground-truth velocity rose
+    # from 0.0049 at tau=0.05 to 1.1302 at tau=0.95, versus a flat 0.0023
+    # here -- which pushed the model to shrink its output toward zero.
+    step_scale_mode: remaining
+
+model:
+  geometric_encoder:
+    # The 6 EGNN layers hold the largest activations in the model at atom
+    # resolution: measured at 512 residues and batch 16, halving the layer
+    # count freed 16.6 GiB (~5.5 GiB per layer). Recomputing them costs ~23%
+    # step time (0.810 -> 0.997 s/step at batch 16) and cuts peak memory 58%
+    # (54.8 -> 22.9 GiB), which is what makes batch 32 fit at the 512 cap.
+    gradient_checkpointing: true
+
+train:
+  num_epochs: 1          # unused while rotating: length comes from num_cycles x steps_per_chunk
+  max_steps: null        # hard cap across the whole rotation, if you want one
+  # Must not exceed one pass (77-78 steps at batch 32 on 2 GPUs), or some
+  # passes contain no multiple of log_every and their epoch never appears:
+  # the first run skipped epochs 5, 10, 14 and 19 of every chunk that way.
+  # A window of L consecutive steps always contains a multiple of k when
+  # L >= k, so anything <= 77 logs every pass at least once. It cannot be
+  # pinned to the pass length itself, which varies per chunk (309/310/312
+  # were all observed) as domains fail to load or exceed mdcath_max_residues.
+  log_every: 50
+  # More often than mdcath_full's 2000: with chunks turning over every
+  # steps_per_chunk steps, validation is the only comparable signal, and its
+  # cost is bounded by val_max_batches.
+  val_every: 500
+  ckpt_dir: checkpoints_mdcath_backbone
+  amp: true
+  device: cuda
+  seed: 0
+  # A run that has downloaded terabytes must be able to continue where it
+  # stopped; "auto" picks up {ckpt_dir}/last.pt when it exists.
+  resume: auto
+  # The whole holdout, not a batch count. val_max_batches counts *batches*,
+  # so the previous value of 50 silently changed what was measured whenever
+  # batch_size moved: raising it from 4 to 8 took validation from 200 to 400
+  # of the 1,250 pairs and shifted zero_fm from 51.79 to 37.03, making two
+  # runs of the same model incomparable. null evaluates all 1,250 -- ~20
+  # batches per rank at batch 32, so it is also cheaper than the old setting.
+  val_max_batches: null
+  val_endpoint_enabled: true
+  val_endpoint_num_steps: 10
+  val_endpoint_max_batches: 10
+  val_endpoint_solver: heun
+  optim:
+    # These two override mdcath_full's, which were tuned against its
+    # val_every: 2000. Validating 4x more often (once per 500 steps, so
+    # several times per resident chunk) silently made ReduceLROnPlateau 4x
+    # more aggressive in wall-clock terms: patience 3 became "halve the LR
+    # after 1500 flat steps". Measured on the first run, the LR fell
+    # 3e-4 -> 1.5e-4 -> 7.5e-5 within 5200 steps, heading for min_lr by
+    # ~20k -- while this repo's own frame-gap ablation needed ~48k steps to
+    # reach a meaningful FM improvement. 15 restores the original ~7500-step
+    # patience, and the raised floor keeps a long run from flatlining.
+    plateau_patience: 15
+    min_lr: 0.00001

@@ -1,0 +1,121 @@
+# Full-dataset training with the displacement flow: noise -> (x1 - x0).
+#
+# Everything about the data pipeline, the network and the schedule is
+# inherited from mdcath_backbone_rotate.yaml, which is left untouched so the
+# completed coordinate-space run stays reproducible. What changes here is the
+# *objective*, and only the objective.
+#
+# Why: the coordinate-space run (67,250 steps, 27/27 chunks, exit 0) trained
+# cleanly by every training-time metric -- fm_improvement 31.2% -- and then
+# produced structures that moved 4.7% of the required distance and never beat
+# the do-nothing baseline. A scale sweep over its rollout showed no constant
+# gain helps (k=1: -0.05%, k=10: -4.12%, k=100: -180%), so it was not an
+# under-scaled field. It was the formulation: with x0 as both the flow's
+# starting point and its conditioning, the base distribution is a point mass
+# and the marginal velocity at tau=0 reduces to E[x1|x0] - x0, which for two
+# frames of the same equilibrium ensemble is ~0. The model was regressing to
+# the conditional mean, not sampling the conditional distribution.
+#
+# Usage (identical to the run it replaces):
+#   scripts/run_training_tmux.sh -c configs/mdcath_backbone_rotate_displacement.yaml \
+#       -g 0,1 -n 2 --restarts 20
+
+base_config: mdcath_backbone_rotate.yaml
+
+flow:
+  path_type: displacement
+  # Per-axis std of the base distribution, in angstroms. Measured over the
+  # full 1,250-pair holdout at backbone resolution:
+  #     320 K  RMS|delta| = 1.989 A      413 K  4.688 A
+  #     348 K              2.728 A       450 K  7.797 A
+  #     379 K              3.545 A       all    4.620 A
+  # 4.620 / sqrt(3) = 2.667 per axis, so E||eps||^2 == E||delta||^2 globally.
+  #
+  # One value for all five temperatures, on purpose. The 3.9x spread from
+  # 320 K to 450 K is the thing the temperature conditioning has to learn;
+  # matching sigma per temperature would supply that spread through the noise
+  # scale and make the result unmeasurable.
+  noise_scale: 2.667
+  # Optionally smooth the base noise over the source structure's k-NN graph,
+  # so the flow starts from something that already moves like a protein.
+  # OFF, because it was tried and measured and it loses.
+  #
+  # The motivation was sound. Real displacements are collective -- measured
+  # direction correlation C(r) = <d_i.d_j>/<|d_i||d_j|> over the holdout is
+  # 0.959 within 4 A, 0.598 at 6-8 A, and *negative* beyond 16 A -- while
+  # i.i.d. noise has none of that, and generated motion reproduced MD's curve
+  # only as far as the decoder's one-hop k-NN reach before stopping dead
+  # (0.281 vs 0.556 at 6-8 A, -0.032 vs 0.222 at 8-12 A). Smoothing fixes the
+  # base distribution's curve outright: RMSE against MD falls 0.495 (0 rounds)
+  # -> 0.146 (4) -> 0.071 (8), negative tail included.
+  #
+  # It still loses. Head-to-head at 1,500 steps on the same 4 domains and
+  # seed, evaluated per temperature against MD on 2 held-out domains:
+  #
+  #                        0 rounds   8 rounds   MD
+  #     moved                 1.261      1.610   1.0
+  #     spread                1.746      2.134   1.414
+  #     profile r            +0.533     +0.429   > 0.5
+  #     contact J             0.431      0.407   0.585
+  #     bond                  1.330      2.097   --
+  #     velocity cosine       0.759      0.555   --
+  #     fm improvement         69.7%      45.4%  --
+  #
+  # Smoothing led on the physics terms early (bond 0.093 vs 9.99 at step 0,
+  # since collective motion does not stretch bonds) but the trained model was
+  # worse everywhere, including physics.
+  #
+  # The cause is identified and is a conflict with this repo's own feature
+  # design, not with the idea: the flow state reaches the network through
+  # three invariant edge scalars, and one of them is ||s_j - s_i||, which
+  # measures exactly what smoothing removes. Its mean falls 6.00 -> 1.43 at 8
+  # rounds while the other two hold at ~2.64, starving a third of the
+  # flow-state signal. See the note in models/geometric_encoder.py. Retrying
+  # this is worthwhile once that feature is made scale-free; until then, 0.
+  noise_smoothing_rounds: 0
+
+loss:
+  # Scale-free cosine term. Pure MSE is minimised by shrinking toward zero
+  # wherever the target is dominated by unpredictable thermal noise, which is
+  # exactly the trap the previous run fell into (||v_pred||/||v_target|| sat
+  # at 0.0024 for 34,500 steps). This keeps paying for direction after the
+  # magnitude has been given up on. 0.1 matches MAI's w_dir.
+  lambda_direction: 0.1
+  # Required: the endpoint rollout integrates in coordinate space and never
+  # builds a flow state, so it cannot run against this model. config.py
+  # rejects the combination rather than letting it fail deep in a forward
+  # pass. Sampled-structure quality is measured by scripts/evaluate_ensemble.py
+  # instead, which is only meaningful now that sampling is stochastic.
+  endpoint_enabled: false
+
+data:
+  # Unchanged at 32, re-measured because carrying the flow state is not free:
+  # three extra edge scalars widen every EGNN layer's edge MLP, and the
+  # decoder gains two coefficient heads. At the 512-residue cap on a 95.0 GiB
+  # card, versus the coordinate-space run in the same harness:
+  #     batch 16 -> 27.6 GiB, 1.270 s/step   (was 22.9 GiB, 0.997)
+  #     batch 32 -> 53.7 GiB, 2.391 s/step   (was 42.8 GiB, 1.879)   <- chosen
+  #     batch 48 -> 79.9 GiB, 3.568 s/step   (was 62.6 GiB, 2.818)
+  # So +25% memory and +27% step time. 32 still leaves ~41 GiB of headroom for
+  # DDP gradient buckets and allocator fragmentation over a multi-day run;
+  # 48 would leave 15 GiB, which is not enough to survive one.
+  batch_size: 32
+
+model:
+  decoder:
+    # Must stay on. The displacement the flow transports is exactly
+    # zero-centre-of-mass (Kabsch sets centroid(x1_aligned) == centroid(x0);
+    # measured max |COM(delta)| = 5.2e-05 A over the holdout), and the noise
+    # is drawn in that same subspace. Letting a mean velocity through would
+    # translate the generated structure with nothing able to correct it.
+    remove_com_velocity: true
+
+train:
+  # Separate directory: resume: auto is inherited, and pointing it at the
+  # coordinate-space checkpoints would try to load a state dict whose decoder
+  # and encoder are sized for the smaller edge-feature vector.
+  ckpt_dir: checkpoints_mdcath_displacement
+  # The rollout metric this reported measures the wrong thing for a
+  # stochastic model -- see the note in scripts/evaluate_checkpoint.py -- and
+  # config.py rejects it alongside loss.endpoint_enabled anyway.
+  val_endpoint_enabled: false

@@ -10,6 +10,11 @@ Multiple GPUs (DistributedDataParallel, one process per GPU):
 The same script serves both: `protein_flow.distributed.setup_distributed`
 detects the environment variables torchrun sets and initialises the process
 group only when they are present.
+
+Configs with `data.rotation.enabled` train on more shards than fit on disk
+by downloading, training on and deleting one chunk at a time
+(`protein_flow.train_rotating`); everything else runs the ordinary
+single-pass loop. Same entry point either way.
 """
 from __future__ import annotations
 
@@ -41,7 +46,12 @@ def main() -> None:
 
     config = load_config(args.config)
     ckpt_dir = Path(config.train.ckpt_dir)
-    train(config, config_save_path=ckpt_dir / "config.yaml")
+    if config.data.rotation.enabled:
+        from protein_flow.train_rotating import train_rotating
+
+        train_rotating(config, config_save_path=ckpt_dir / "config.yaml")
+    else:
+        train(config, config_save_path=ckpt_dir / "config.yaml")
 
 
 if __name__ == "__main__":
