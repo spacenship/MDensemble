@@ -14,3 +14,7 @@ checkpoints_mdcath_large/
 checkpoints_mdcath_backbone/
 checkpoints_mdcath_displacement/
 checkpoints_mdcath_displacement_norigid/
+
+# Keep all model checkpoints and generated ablation outputs out of Git.
+checkpoints*/
+ablation_logs/
